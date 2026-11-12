@@ -147,6 +147,21 @@ public final class BattleHud implements Disposable {
           14, new TextField(2, -2, 44, 26, 22, 0xffcecece, 0xff000000, Align.center),
           12, new TextField(2, -2, 44, 26, 22, 0xffffffff, 0xff000000, Align.left));
 
+  /**
+   * The centre of an ability button's icon place: the box of its {@code icon} text field ({@code
+   * icon_ability}'s field 10: -2, -23 to 24, 6; {@code icon_cast}'s field 15: -2, -75 to 72, 6),
+   * where the icon clip's origin goes. DATA: both boxes' centres fall on the round back's centre at
+   * every state and cast frame, while the fields' origins sit 11 du left of it and 7.6 below
+   * (icon_ability) or 35 left and 33 below (icon_cast); the icons are drawn about their own origin.
+   */
+  static float[] iconFieldCentre(int textId) {
+    return switch (textId) {
+      case 10 -> new float[] {11f, -8.5f};
+      case 15 -> new float[] {35f, -34.5f};
+      default -> new float[] {0f, 0f};
+    };
+  }
+
   /** A row of health_bars.csv. */
   private record BarStyle(
       String player,
@@ -1739,7 +1754,8 @@ public final class BattleHud implements Disposable {
               public void text(String name, int textId, Affine2 world, float alpha) {
                 switch (name) {
                   case "icon" -> {
-                    iconAt[0] = new Affine2(world);
+                    float[] c = iconFieldCentre(textId);
+                    iconAt[0] = new Affine2(world).translate(c[0], c[1]);
                     iconAlpha[0] = alpha;
                   }
                   case "count" -> drawText(ABILITY_TEXT.get(textId), cost, world, alpha);
