@@ -1,0 +1,974 @@
+<!doctype html>
+<!--
+  crforge - https://github.com/voonhous/crforge
+  SPDX-License-Identifier: Apache-2.0
+  The phone server's page (docs/phone-server.md): draws the frames the server streams (as draw
+  lists, with WebGL, or as JPEG), sends the player's taps, and plays the battle's sounds with Web
+  Audio. No build step: plain JS.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="crforge">
+<meta name="theme-color" content="#000000">
+<meta name="referrer" content="no-referrer">
+<title>crforge</title>
+<style>
+  :root { --fg: #f4f1e8; --bg: #000; --panel: rgba(16, 22, 34, 0.92); --accent: #f6c344; --bad: #e0574c; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden;
+    overscroll-behavior: none; -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+    font: 15px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  body { position: fixed; inset: 0; touch-action: none; }
+  #stage { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  canvas { display: block; touch-action: none; background: #0d1210; }
+  .overlay { position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, 0.55); z-index: 10; padding: 16px; box-sizing: border-box; }
+  .overlay.on { display: flex; }
+  .card { background: var(--panel); border-radius: 14px; padding: 18px 18px 14px; width: min(92vw, 380px);
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5); max-height: 90vh; overflow-y: auto; touch-action: pan-y; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 18px; margin: 0 0 10px; }
+  p { margin: 6px 0; }
+  .muted { opacity: 0.7; font-size: 13px; }
+  label { display: block; margin: 10px 0 4px; font-size: 13px; opacity: 0.85; }
+  select { width: 100%; font-size: 16px; padding: 8px; border-radius: 8px; border: 1px solid #445;
+    background: #1d2433; color: var(--fg); }
+  button { font: inherit; font-size: 17px; font-weight: 600; border: 0; border-radius: 10px; padding: 12px 16px;
+    background: var(--accent); color: #241a00; width: 100%; margin-top: 12px; touch-action: manipulation; }
+  button.secondary { background: #2c3650; color: var(--fg); }
+  .row { display: flex; gap: 8px; }
+  .row button { flex: 1; }
+  /* top centre: the HUD's opponent name is at the top left and its clock at the top right */
+  #hud { position: absolute; top: calc(env(safe-area-inset-top) + 6px); left: 50%; transform: translateX(-50%); z-index: 5; display: flex; gap: 6px; }
+  #hud button { width: auto; margin: 0; padding: 6px 10px; font-size: 13px; background: rgba(20, 26, 40, 0.75); color: var(--fg); }
+  #toast { position: absolute; left: 50%; bottom: 24%; transform: translateX(-50%); z-index: 6; pointer-events: none;
+    background: rgba(0, 0, 0, 0.75); padding: 8px 14px; border-radius: 10px; font-size: 14px; opacity: 0;
+    transition: opacity 0.2s; max-width: 80vw; text-align: center; }
+  #toast.on { opacity: 1; }
+  #stats { position: absolute; left: 50%; transform: translateX(-50%); top: calc(env(safe-area-inset-top) + 44px); z-index: 5; font: 11px/1.3 ui-monospace, Menlo, monospace;
+    background: rgba(0, 0, 0, 0.6); padding: 4px 6px; border-radius: 6px; display: none; white-space: pre; pointer-events: none; }
+  #banner { position: absolute; left: 0; right: 0; top: 40%; text-align: center; z-index: 4; pointer-events: none;
+    font-size: 20px; font-weight: 700; text-shadow: 0 2px 6px #000; display: none; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="view" width="720" height="1560"></canvas><canvas id="gl" width="720" height="1560" style="display:none"></canvas></div>
+<div id="hud"><button id="soundBtn">Sound on</button><button id="menuBtn">Menu</button></div>
+<div id="stats"></div>
+<div id="banner"></div>
+<div id="toast"></div>
+
+<div class="overlay on" id="startScreen"><div class="card">
+  <h1>crforge</h1>
+  <p class="muted" id="startInfo">Connecting...</p>
+  <button id="startBtn" disabled>Tap to play</button>
+  <p class="muted">The sound starts with this tap. Drag a card onto the arena, or tap a card then tap where it goes.</p>
+</div></div>
+
+<div class="overlay" id="menu"><div class="card">
+  <h2>New battle</h2>
+  <label for="optOpponent">Opponent</label>
+  <select id="optOpponent"><option value="bot">Bot</option><option value="friend">A friend on another phone</option></select>
+  <label for="optDeck">Your deck</label><select id="optDeck"></select>
+  <label for="optOppDeck">Opponent's deck</label><select id="optOppDeck"></select>
+  <label for="optLocation">Arena</label><select id="optLocation"></select>
+  <button id="newBtn">Start new battle</button>
+  <label for="optPicture">Picture (applies now)</label>
+  <select id="optPicture">
+    <option value="draw">Drawn on this phone: sharp, under 1 Mbit/s</option>
+    <option value="high">Video, sharp: fast home Wi-Fi</option>
+    <option value="medium">Video, balanced: tunnel, good network</option>
+    <option value="low">Video, light: phone network, slow tunnel</option>
+  </select>
+  <div class="row"><button class="secondary" id="statsBtn">Stats</button><button class="secondary" id="closeMenu">Close</button></div>
+  <p class="muted" id="menuInfo"></p>
+</div></div>
+
+<div class="overlay" id="endScreen"><div class="card">
+  <h2 id="endTitle">Battle over</h2>
+  <button id="rematchBtn">Play again</button>
+  <button class="secondary" id="endMenuBtn">Change battle</button>
+</div></div>
+
+<div class="overlay" id="lost"><div class="card">
+  <h2>Connection lost</h2>
+  <p class="muted" id="lostInfo">Reconnecting...</p>
+  <button id="reconnectBtn">Reconnect</button>
+</div></div>
+
+<script>
+"use strict";
+// The draw-list player (docs/phone-server.md, "Drawn on the phone"): the server records what its
+// renderer draws and sends each frame as polygons (DrawCodec.java: the changes from the last frame
+// sent, deflated), and the parts of its textures they use as patches of texture pages
+// (TextureStore.java). This draws them with WebGL at the screen's own resolution, as the server's
+// batch would: same triangles, texture coordinates, vertex colours, blending and shader maths.
+window.crforgeDraw = (() => {
+  let lost = false;
+  let gl = null, gl2 = false, prog = null, U = {}, vbo = null, ibo = null, white = null, canvasEl = null;
+  let generation = 0;
+  const pages = new Map();    // id -> { tex, w, h, plain, mip, dirty }
+  const states = new Map();   // id -> { blend, src, dst, sa, da, shader, add: [r, g, b], gray }
+  const regions = new Map();  // id -> { tex, kind, n, uv: Float32Array, idx }
+  let lastShape = new Map();  // region -> Int32Array of vertex offsets (NEW ops)
+  let reference = null;       // the last frame decoded
+  let vtx = new ArrayBuffer(1 << 20), vf = new Float32Array(vtx), vu = new Uint32Array(vtx);
+  let ind = new Uint32Array(1 << 18);
+  const stats = { patchBytes: 0, patches: 0, pagesMB: 0 };
+
+  const VS = "attribute vec2 a_pos; attribute vec2 a_uv; attribute vec4 a_color; uniform vec2 u_scale;\n" +
+    "varying vec4 v_color; varying vec2 v_uv;\n" +
+    "void main() { v_color = a_color; v_color.a = v_color.a * (255.0/254.0); v_uv = a_uv;\n" +
+    "  gl_Position = vec4(a_pos * u_scale - 1.0, 0.0, 1.0); }";
+  // the server's shaders in one: libgdx's default, ScDrawer's and EffectDrawer's added colour,
+  // HudArt's clamp and grey, the silhouette's coverage
+  const FS = "precision highp float; varying vec4 v_color; varying vec2 v_uv; uniform sampler2D u_tex;\n" +
+    "uniform vec3 u_add; uniform float u_gray; uniform float u_sil; uniform float u_clamp;\n" +
+    "void main() { vec4 t = texture2D(u_tex, v_uv);\n" +
+    "  vec4 c = u_sil > 0.5 ? v_color * t.a : v_color * t;\n" +
+    "  c.rgb += u_add * (v_color.a * t.a);\n" +
+    "  if (u_clamp > 0.5) { c.rgb = min(c.rgb, vec3(c.a));\n" +
+    "    c.rgb = mix(c.rgb, vec3(dot(c.rgb, vec3(0.299, 0.587, 0.114))), u_gray); }\n" +
+    "  gl_FragColor = c; }";
+
+  function init(canvas) {
+    canvasEl = canvas;
+    const opts = { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: true, preserveDrawingBuffer: false, powerPreference: "high-performance" };
+    gl = canvas.getContext("webgl2", opts);
+    gl2 = !!gl;
+    if (!gl) {
+      gl = canvas.getContext("webgl", opts);
+      if (!gl || !gl.getExtension("OES_element_index_uint")) { gl = null; return false; }
+    }
+    setup();
+    // iOS may drop the GL context (memory, the app in the background): the textures are gone, so
+    // the page reconnects and the server sends them again
+    canvas.addEventListener("webglcontextlost", (e) => { e.preventDefault(); lost = true; }, false);
+    canvas.addEventListener("webglcontextrestored", () => {
+      lost = false; pages.clear(); reset();
+      if (!gl2) gl.getExtension("OES_element_index_uint");
+      setup();
+      if (api.onRestored) api.onRestored();
+    }, false);
+    return true;
+  }
+  function setup() {
+    const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+    prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+    gl.bindAttribLocation(prog, 0, "a_pos"); gl.bindAttribLocation(prog, 1, "a_uv"); gl.bindAttribLocation(prog, 2, "a_color");
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    for (const u of ["u_scale", "u_tex", "u_add", "u_gray", "u_sil", "u_clamp"]) U[u] = gl.getUniformLocation(prog, u);
+    vbo = gl.createBuffer(); ibo = gl.createBuffer();
+    white = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, white);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
+    filters(false, false);
+  }
+  function filters(mip, npot) {
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mip ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+
+  // A new set of pages and definitions (a new battle on a fresh texture store, or a reconnect).
+  function reset() {
+    generation++;
+    if (!lost) for (const p of pages.values()) gl.deleteTexture(p.tex);
+    pages.clear(); states.clear(); regions.clear(); lastShape = new Map(); reference = null;
+    stats.pagesMB = 0;
+  }
+
+  // A patch: an image (straight alpha) copied into a page at x, y. Art pages are premultiplied
+  // on upload (as the server's ArtCache premultiplies its atlases) and mipmapped.
+  async function patch(buf) {
+    const dv = new DataView(buf);
+    const plain = (dv.getUint8(1) & 1) !== 0;
+    const id = dv.getInt32(4), pw = dv.getInt32(8), ph = dv.getInt32(12), x = dv.getInt32(16), y = dv.getInt32(20);
+    const gen = generation;
+    stats.patchBytes += buf.byteLength; stats.patches++;
+    const blob = new Blob([new Uint8Array(buf, 24)], { type: "image/png" });
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.src = url;
+    try { await img.decode(); } catch (e) { URL.revokeObjectURL(url); return; }
+    URL.revokeObjectURL(url);
+    if (gen !== generation || !gl || lost) return;
+    let p = pages.get(id);
+    if (!p) {
+      const pot = (pw & (pw - 1)) === 0 && (ph & (ph - 1)) === 0;
+      p = { tex: gl.createTexture(), w: pw, h: ph, plain, mip: !plain && (gl2 || pot), dirty: false };
+      gl.bindTexture(gl.TEXTURE_2D, p.tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, pw, ph, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      filters(p.mip);
+      pages.set(id, p);
+      stats.pagesMB += pw * ph * 4 * (p.mip ? 4 / 3 : 1) / 1048576;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, p.tex);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, !plain);
+    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    if (p.mip) p.dirty = true;
+  }
+
+  async function inflate(u8) {
+    const ds = new DecompressionStream("deflate-raw");
+    const out = new Response(new Blob([u8]).stream().pipeThrough(ds));
+    return new Uint8Array(await out.arrayBuffer());
+  }
+
+  // Decodes a frame's payload (deflated) against the last frame decoded; see DrawCodec.java.
+  async function decode(u8) {
+    const b = await inflate(u8);
+    let at = 0;
+    const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    const u = () => b[at++];
+    const v = () => { let r = 0, s = 0, x; do { x = b[at++]; r |= (x & 0x7f) << s; s += 7; } while (x & 0x80); return r >>> 0; };
+    const z = () => { const r = v(); return (r >>> 1) ^ -(r & 1); };
+    const i32 = () => { const r = dv.getInt32(at, true); at += 4; return r; };
+    const f32 = () => { const r = dv.getFloat32(at, true); at += 4; return r; };
+    const key = (u() & 1) !== 0;
+    if (key) lastShape = new Map();
+    const ref = key || !reference ? { count: 0 } : reference;
+    for (let k = v(); k > 0; k--) {
+      const id = v(), blend = u() !== 0, src = v(), dst = v(), sa = v(), da = v(), shader = u();
+      const add = [f32(), f32(), f32()], gray = f32();
+      states.set(id, { blend, src, dst, sa, da, shader, add, gray });
+    }
+    for (let k = v(); k > 0; k--) {
+      const id = v(), tex = v(), kind = u(), n = v();
+      const uv = new Float32Array(2 * n);
+      for (let i = 0; i < 2 * n; i++) uv[i] = f32();
+      let idx = null;
+      if (kind === 2) { idx = new Uint16Array(v()); for (let i = 0; i < idx.length; i++) idx[i] = v(); }
+      regions.set(id, { tex, kind, n, uv, idx });
+    }
+    const count = v();
+    const f = { count, state: new Int32Array(count), region: new Int32Array(count), verts: new Int32Array(count),
+      one: new Uint8Array(count), colorAt: new Int32Array(count), posAt: new Int32Array(count),
+      colors: new Int32Array(Math.max(16, (ref.colorLen || 0) + count * 2)), colorLen: 0,
+      pos: new Int32Array(Math.max(64, (ref.posLen || 0) + count * 8)), posLen: 0, bytes: u8.byteLength, raw: b.byteLength };
+    let n = 0;
+    const room = (c, p) => {
+      if (f.colorLen + c > f.colors.length) { const a = new Int32Array(2 * (f.colorLen + c)); a.set(f.colors); f.colors = a; }
+      if (f.posLen + p > f.pos.length) { const a = new Int32Array(2 * (f.posLen + p)); a.set(f.pos); f.pos = a; }
+    };
+    const begin = (state, region, nv, one) => {
+      f.state[n] = state; f.region[n] = region; f.verts[n] = nv; f.one[n] = one ? 1 : 0;
+      f.colorAt[n] = f.colorLen; f.posAt[n] = f.posLen; room(one ? 1 : nv, 2 * nv); n++;
+    };
+    // a reference polygon again: moved by dx, dy, its other vertices by res, colours replaced
+    const again = (m, state, colors, dx, dy, res) => {
+      const nv = ref.verts[m];
+      if (colors) { begin(state, ref.region[m], nv, colors.length === 1); for (const c of colors) f.colors[f.colorLen++] = c; }
+      else { const one = ref.one[m] === 1; begin(state, ref.region[m], nv, one); const c0 = ref.colorAt[m];
+        for (let k = 0, c = one ? 1 : nv; k < c; k++) f.colors[f.colorLen++] = ref.colors[c0 + k]; }
+      const p0 = ref.posAt[m];
+      for (let k = 0; k < nv; k++) {
+        f.pos[f.posLen++] = ref.pos[p0 + 2 * k] + dx + (k && res ? res[2 * k - 2] : 0);
+        f.pos[f.posLen++] = ref.pos[p0 + 2 * k + 1] + dy + (k && res ? res[2 * k - 1] : 0);
+      }
+    };
+    let expected = 0, prevState = -1, prevX = 0, prevY = 0;
+    while (n < count) {
+      const op = u();
+      if (op < 0x40) {
+        for (let k = 0; k <= op; k++) { again(expected, ref.state[expected], null, 0, 0, null); expected++; }
+      } else if (op < 0x80) {
+        let m = expected;
+        if (op & 1) m += z();
+        const state = op & 2 ? v() : ref.state[m];
+        let colors = null;
+        if (op & 4) { const each = u() !== 0; colors = new Int32Array(each ? ref.verts[m] : 1); for (let k = 0; k < colors.length; k++) colors[k] = i32(); }
+        let dx = 0, dy = 0;
+        if (op & 8) { dx = z(); dy = z(); }
+        let res = null;
+        if (op & 16) { res = new Int32Array(2 * (ref.verts[m] - 1)); for (let k = 0; k < res.length; k++) res[k] = z(); }
+        again(m, state, colors, dx, dy, res);
+        expected = m + 1;
+      } else {
+        const state = op & 1 ? v() : prevState;
+        const region = v(), nv = regions.get(region).n, each = (op & 2) !== 0;
+        begin(state, region, nv, !each);
+        for (let k = 0; k < (each ? nv : 1); k++) f.colors[f.colorLen++] = i32();
+        const x = prevX + z(), y = prevY + z();
+        f.pos[f.posLen++] = x; f.pos[f.posLen++] = y;
+        if (op & 4) {
+          const s = lastShape.get(region);
+          for (let k = 1; k < nv; k++) { f.pos[f.posLen++] = x + s[2 * k - 2]; f.pos[f.posLen++] = y + s[2 * k - 1]; }
+        } else {
+          const s = new Int32Array(2 * (nv - 1));
+          let px = x, py = y;
+          for (let k = 1; k < nv; k++) { px += z(); py += z(); f.pos[f.posLen++] = px; f.pos[f.posLen++] = py; s[2 * k - 2] = px - x; s[2 * k - 1] = py - y; }
+          lastShape.set(region, s);
+        }
+      }
+      const last = n - 1;
+      prevState = f.state[last]; prevX = f.pos[f.posAt[last]]; prevY = f.pos[f.posAt[last] + 1];
+    }
+    reference = f;
+    return f;
+  }
+
+  // Draws a decoded frame of w x h frame pixels over the whole canvas, in order, one GL draw per
+  // run of polygons with the same page and state.
+  function draw(f, w, h, clear) {
+    const t0 = performance.now();
+    if (lost) return { ms: 0, draws: 0, verts: 0, missing: 0 };
+    for (const p of pages.values()) if (p.dirty) { gl.bindTexture(gl.TEXTURE_2D, p.tex); gl.generateMipmap(gl.TEXTURE_2D); p.dirty = false; }
+    let nv = 0, ni = 0;
+    for (let i = 0; i < f.count; i++) { nv += f.verts[i]; const r = regions.get(f.region[i]); ni += r.kind === 0 ? 3 * (r.n - 2) : r.kind === 1 ? 6 : r.idx.length; }
+    if (nv * 20 > vtx.byteLength) { vtx = new ArrayBuffer(nv * 40); vf = new Float32Array(vtx); vu = new Uint32Array(vtx); }
+    if (ni > ind.length) ind = new Uint32Array(ni * 2);
+    gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    gl.clearColor(clear[0], clear[1], clear[2], 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(prog);
+    gl.uniform2f(U.u_scale, 2 / (w * 16), 2 / (h * 16));
+    gl.uniform1i(U.u_tex, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    const runs = [];
+    let o = 0, k = 0, base = 0, runTex = -2, runState = -2, runStart = 0;
+    for (let i = 0; i < f.count; i++) {
+      const r = regions.get(f.region[i]), n = f.verts[i], st = f.state[i];
+      if (r.tex !== runTex || st !== runState) {
+        if (k > runStart) runs.push(runTex, runState, runStart, k - runStart);
+        runTex = r.tex; runState = st; runStart = k;
+      }
+      const p0 = f.posAt[i], c0 = f.colorAt[i], one = f.one[i] === 1;
+      for (let j = 0; j < n; j++) {
+        vf[o] = f.pos[p0 + 2 * j]; vf[o + 1] = f.pos[p0 + 2 * j + 1];
+        vf[o + 2] = r.uv[2 * j]; vf[o + 3] = r.uv[2 * j + 1];
+        vu[o + 4] = f.colors[one ? c0 : c0 + j];
+        o += 5;
+      }
+      if (r.kind === 0) for (let j = 0; j + 2 < n; j++) { ind[k++] = base + j; ind[k++] = base + j + 1; ind[k++] = base + j + 2; }
+      else if (r.kind === 1) { ind[k++] = base; ind[k++] = base + 1; ind[k++] = base + 2; ind[k++] = base + 2; ind[k++] = base + 3; ind[k++] = base; }
+      else for (let j = 0; j < r.idx.length; j++) ind[k++] = base + r.idx[j];
+      base += n;
+    }
+    if (k > runStart) runs.push(runTex, runState, runStart, k - runStart);
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vtx, 0, o), gl.STREAM_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, ind.subarray(0, k), gl.STREAM_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 20, 0);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 20, 8);
+    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 4, gl.UNSIGNED_BYTE, true, 20, 16);
+    let curState = null, curTex = null, missing = 0;
+    for (let q = 0; q < runs.length; q += 4) {
+      const tex = runs[q], s = states.get(runs[q + 1]);
+      const page = tex === 0 ? null : pages.get(tex);
+      if (tex !== 0 && !page) { missing++; continue; }
+      const t = page ? page.tex : white;
+      if (t !== curTex) { gl.bindTexture(gl.TEXTURE_2D, t); curTex = t; }
+      if (s !== curState) {
+        if (s.blend) { gl.enable(gl.BLEND); gl.blendFuncSeparate(s.src, s.dst, s.sa, s.da); } else gl.disable(gl.BLEND);
+        const addOn = s.shader === 1 || s.shader === 2;
+        gl.uniform3f(U.u_add, addOn ? s.add[0] : 0, addOn ? s.add[1] : 0, addOn ? s.add[2] : 0);
+        gl.uniform1f(U.u_gray, s.shader === 2 ? s.gray : 0);
+        gl.uniform1f(U.u_clamp, s.shader === 2 ? 1 : 0);
+        gl.uniform1f(U.u_sil, s.shader === 3 ? 1 : 0);
+        curState = s;
+      }
+      gl.drawElements(gl.TRIANGLES, runs[q + 3], gl.UNSIGNED_INT, runs[q + 2] * 4);
+    }
+    return { ms: performance.now() - t0, draws: runs.length / 4, verts: nv, missing };
+  }
+
+  function readPixels() {
+    const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight, px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    return { w, h, px };
+  }
+
+  const api = { init, reset, patch, decode, draw, readPixels, stats, onRestored: null, get ready() { return !!gl; }, get gl2() { return gl2; },
+    get pageCount() { return pages.size; } };
+  return api;
+})();
+</script>
+<script>
+"use strict";
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const params = new URLSearchParams(location.search);
+  const token = params.get("t") || "";
+  const q = token ? "?t=" + encodeURIComponent(token) : "";
+  const jpegCanvas = $("view"), glCanvas = $("gl");
+  let canvas = jpegCanvas;   // the one shown (taps are mapped through it)
+  const ctx2d = jpegCanvas.getContext("2d", { alpha: false });
+  const D = window.crforgeDraw;
+  let drawOK = null;         // whether this browser can draw the draw lists (WebGL, inflate)
+  let waitArt = false;       // the start button waits for the first frame drawn here
+  let clearColor = [0.11, 0.13, 0.12];
+  function canDraw() {
+    if (drawOK === null) {
+      try { drawOK = typeof DecompressionStream === "function" && D.init(glCanvas); } catch (e) { drawOK = false; }
+      D.onRestored = () => { if (ws) ws.close(); };
+    }
+    return drawOK;
+  }
+
+  let ws = null, hello = null, setup = null, state = null, side = 0;
+  let started = false, retry = 0, retryTimer = null;
+  let frameW = 720, frameH = 1560;
+  let seq = 0;
+  const sentAt = new Map();
+  const HEADER = 20;
+  const stats = { frames: 0, recv: 0, bytes: 0, last: performance.now(), fps: 0, kb: 0, rtt: 0, tap: 0, q: 0, enc: 0, show: false, mode: "", drawMs: 0 };
+
+  // ------------------------------------------------------------------ layout
+  function fit() {
+    const sw = window.innerWidth, sh = window.innerHeight;
+    const scale = Math.min(sw / frameW, sh / frameH);
+    const cw = Math.floor(frameW * scale), ch = Math.floor(frameH * scale);
+    for (const c of [jpegCanvas, glCanvas]) { c.style.width = cw + "px"; c.style.height = ch + "px"; }
+    // the draw lists are drawn at the screen's own resolution
+    const dpr = Math.min(window.devicePixelRatio || 1, 3);
+    glCanvas.width = Math.round(cw * dpr); glCanvas.height = Math.round(ch * dpr);
+  }
+  function show(c) {
+    if (canvas === c) return;
+    canvas = c;
+    jpegCanvas.style.display = c === jpegCanvas ? "block" : "none";
+    glCanvas.style.display = c === glCanvas ? "block" : "none";
+  }
+  window.addEventListener("resize", fit);
+  window.addEventListener("orientationchange", () => setTimeout(fit, 200));
+  document.addEventListener("gesturestart", (e) => e.preventDefault());
+  document.addEventListener("dblclick", (e) => e.preventDefault());
+  document.addEventListener("touchmove", (e) => { if (!e.target.closest(".card")) e.preventDefault(); }, { passive: false });
+
+  function toast(text) {
+    const t = $("toast");
+    t.textContent = text;
+    t.classList.add("on");
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(() => t.classList.remove("on"), 1800);
+  }
+
+  // ------------------------------------------------------------------ socket
+  function connect() {
+    clearTimeout(retryTimer);
+    if (ws) { try { ws.close(); } catch (e) {} }
+    const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws" + q;
+    ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => { retry = 0; $("lost").classList.remove("on"); };
+    ws.onmessage = (ev) => {
+      if (typeof ev.data === "string") onText(JSON.parse(ev.data));
+      else onFrame(ev.data);
+    };
+    ws.onclose = () => {
+      ws = null;
+      if (!hello) { $("startInfo").textContent = "Cannot reach the server (or the token is wrong)."; }
+      $("lost").classList.add("on");
+      const wait = Math.min(10000, 1000 * Math.pow(2, retry++));
+      $("lostInfo").textContent = "Reconnecting in " + Math.round(wait / 1000) + " s...";
+      retryTimer = setTimeout(connect, wait);
+    };
+  }
+  function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+  setInterval(() => send({ type: "ping", c: performance.now() }), 2000);
+
+  function onText(m) {
+    switch (m.type) {
+      case "hello":
+        hello = m; frameW = m.width; frameH = m.height;
+        if (m.clear) clearColor = m.clear;
+        jpegCanvas.width = frameW; jpegCanvas.height = frameH; fit();
+        // a new connection: the server sends the textures and a key frame afresh
+        if (canDraw()) D.reset();
+        playout.ready.length = 0; playout.waiting.length = 0;
+        if (picture() === "draw" && !canDraw()) $("menuInfo").textContent = "This browser cannot draw the picture itself (WebGL, DecompressionStream): it gets video.";
+        fillOptions(m.options);
+        // drawn here: play once the art of the first frame is in (a few MB the first time)
+        waitArt = canDraw() && (PICTURES[picture()] || {}).mode === "list" && !started;
+        $("startInfo").textContent = waitArt ? "Loading the art..." : "Connected.";
+        $("startBtn").disabled = waitArt;
+        sendPicture();  // before joining: the first frames come as the page wants them
+        send({ type: "join", seat: params.get("seat") || "auto" });
+        if (started) send({ type: "start" });
+        if (m.audio) audio.loadIndex();
+        break;
+      case "seat": side = m.side; $("optPicture").value = picture(); sendPicture(); break;
+      case "setup": setup = m; showSetup(); break;
+      case "state": state = m; showState(); break;
+      case "snd": for (const s of m.list) later(() => audio.play(s[1])); break;
+      case "music": audio.music(m.ref, m.delay || 0); break;
+      case "input": onInput(m); break;
+      case "pong": stats.rtt = performance.now() - m.c; break;
+      case "reset": if (canDraw()) D.reset(); break;
+    }
+  }
+
+  // sounds wait as long as the picture's jitter buffer holds frames, so they stay in step with it
+  function later(fn) { const d = playout.margin; if (d > 5) setTimeout(fn, d); else fn(); }
+
+  function onInput(m) {
+    if (m.result === "refused" && m.message) toast(m.message);
+  }
+
+  // ------------------------------------------------------------------ frames
+  // Frames are decoded as they arrive and shown on a steady clock: each one at the moment the
+  // server captured it, plus a playout delay. The delay is the link's lowest recent latency plus
+  // a margin that covers its jitter (how much later than that frames have been arriving), so
+  // Wi-Fi hiccups delay the picture a little instead of making it stutter.
+  const playout = {
+    waiting: [],   // received, not yet decoded
+    ready: [],     // decoded, waiting for their moment: { bmp, cap, input }
+    lat: [],       // [arrival time, arrival - capture] over the last few seconds
+    delay: null,   // the playout delay in use (ms, includes the clock offset)
+    margin: 0,     // the part of it that is jitter buffer (ms)
+    decoding: false,
+  };
+  // what the page sees, sent to the server's log every 2 s
+  const tele = { recv: 0, kb: 0, dec: 0, decMax: 0, dropped: 0, shown: 0, gapMax: 0, lastShown: 0, lateMax: 0, t0: performance.now(),
+    listKb: 0, listMax: 0, polys: 0, drawMs: 0, drawMax: 0, drawn: 0, patchKb: 0, missing: 0 };
+  setInterval(() => {
+    const dt = (performance.now() - tele.t0) / 1000;
+    const L = playout.lat;
+    let base = Infinity; for (const x of L) base = Math.min(base, x[1]);
+    const list = stats.mode === "draw" ?
+      `draw lists ${(tele.listKb / Math.max(1, tele.recv)).toFixed(1)} KB avg ${tele.listMax.toFixed(1)} max, ${(tele.polys / Math.max(1, tele.recv)).toFixed(0)} polygons; ` +
+      `draw ${(tele.drawMs / Math.max(1, tele.drawn)).toFixed(1)} ms avg ${tele.drawMax.toFixed(1)} max; patches ${tele.patchKb.toFixed(0)} KB, ` +
+      `${D.pageCount} pages ${D.stats.pagesMB.toFixed(0)} MB; missing ${tele.missing}; ` : "";
+    send({ type: "tele", s:
+      `[${stats.mode || "?"}] recv ${(tele.recv / dt).toFixed(1)} fps ${(tele.kb * 8 / 1024 / dt).toFixed(2)} Mbit/s; ` + list +
+      `decode ${(tele.dec / Math.max(1, tele.recv)).toFixed(1)} ms avg ${tele.decMax.toFixed(0)} max; ` +
+      `dropped before decode ${tele.dropped}; shown ${(tele.shown / dt).toFixed(1)} fps, longest gap ${tele.gapMax.toFixed(0)} ms; ` +
+      `latest arrival +${tele.lateMax.toFixed(0)} ms; buffer ${playout.margin.toFixed(0)} ms; ` +
+      `screen ${screen.width}x${screen.height}@${devicePixelRatio} ${navigator.userAgent.match(/OS [0-9_]+|Version\/[0-9.]+/g)}` });
+    Object.assign(tele, { recv: 0, kb: 0, dec: 0, decMax: 0, dropped: 0, shown: 0, gapMax: 0, lateMax: 0, t0: performance.now(),
+      listKb: 0, listMax: 0, polys: 0, drawMs: 0, drawMax: 0, drawn: 0, patchKb: 0, missing: 0 });
+  }, 2000);
+  function onFrame(buf) {
+    const now = performance.now();
+    const dv = new DataView(buf);
+    const type = dv.getUint8(0);
+    if (type === 3) {
+      // a texture patch: uploaded as soon as its image is decoded
+      tele.kb += buf.byteLength / 1024; tele.patchKb += buf.byteLength / 1024;
+      if (waitArt) $("startInfo").textContent = "Loading the art: " + (D.stats.patchBytes / 1048576 + buf.byteLength / 1048576).toFixed(1) + " MB";
+      if (canDraw()) D.patch(buf);
+      return;
+    }
+    if (type === 2) { onList(buf, dv, now); return; }
+    playout.waiting.push({ buf, cap: dv.getUint32(16), got: now });
+    // a phone that cannot decode as fast as frames arrive skips the oldest
+    while (playout.waiting.length > 3) { ack(playout.waiting.shift().buf); tele.dropped++; }
+    if (!playout.decoding) decodeNext();
+  }
+  function ack(buf) { send({ type: "ack", f: new DataView(buf).getInt32(1) }); }
+  async function decodeNext() {
+    const item = playout.waiting.shift();
+    if (!item) { playout.decoding = false; return; }
+    playout.decoding = true;
+    const buf = item.buf, dv = new DataView(buf);
+    const input = dv.getInt32(9);
+    stats.enc = dv.getInt16(13) / 10; stats.q = dv.getUint8(15);
+    const blob = new Blob([new Uint8Array(buf, HEADER)], { type: "image/jpeg" });
+    let bmp = null;
+    const d0 = performance.now();
+    try {
+      if (window.createImageBitmap) bmp = await createImageBitmap(blob);
+      else bmp = await new Promise((ok, fail) => {
+        const img = new Image(), url = URL.createObjectURL(blob);
+        img.onload = () => { URL.revokeObjectURL(url); ok(img); };
+        img.onerror = fail; img.src = url;
+      });
+    } catch (e) { /* a bad frame: the next one replaces it */ }
+    ack(buf);
+    const dms = performance.now() - d0;
+    tele.recv++; tele.kb += buf.byteLength / 1024; tele.dec += dms; tele.decMax = Math.max(tele.decMax, dms);
+    stats.bytes += buf.byteLength; stats.recv++;
+    if (bmp) {
+      track(item.got, item.got - item.cap);
+      if (playout.lat.length) {
+        let base = Infinity; for (const x of playout.lat) base = Math.min(base, x[1]);
+        tele.lateMax = Math.max(tele.lateMax, item.got - item.cap - base);
+      }
+      playout.ready.push({ bmp, cap: item.cap, input });
+      // a backlog (the page was hidden, or the delay just dropped): keep the newest few
+      while (playout.ready.length > 12) release(playout.ready.shift());
+    }
+    decodeNext();
+  }
+  function release(f) { if (f && f.bmp && f.bmp.close) f.bmp.close(); }
+  // A draw-list frame: each is coded against the one before, so every one is decoded, in order.
+  let listChain = Promise.resolve();
+  function onList(buf, dv, got) {
+    const cap = dv.getUint32(16), input = dv.getInt32(9);
+    stats.enc = dv.getInt16(13) / 10;
+    listChain = listChain.then(async () => {
+      const d0 = performance.now();
+      let f = null;
+      try { if (canDraw()) f = await D.decode(new Uint8Array(buf, HEADER)); } catch (e) { console.warn("draw list", e); }
+      ack(buf);
+      const dms = performance.now() - d0;
+      const kb = buf.byteLength / 1024;
+      tele.recv++; tele.kb += kb; tele.dec += dms; tele.decMax = Math.max(tele.decMax, dms);
+      tele.listKb += kb; tele.listMax = Math.max(tele.listMax, kb);
+      stats.bytes += buf.byteLength; stats.recv++;
+      if (!f) return;
+      tele.polys += f.count;
+      track(got, got - cap);
+      if (playout.lat.length) {
+        let base = Infinity; for (const x of playout.lat) base = Math.min(base, x[1]);
+        tele.lateMax = Math.max(tele.lateMax, got - cap - base);
+      }
+      playout.ready.push({ dl: f, cap, input });
+      while (playout.ready.length > 12) playout.ready.shift();
+    });
+  }
+  function track(now, lat) {
+    const L = playout.lat;
+    L.push([now, lat]);
+    while (L.length && now - L[0][0] > 4000) L.shift();
+    let base = Infinity;
+    for (const x of L) base = Math.min(base, x[1]);
+    const late = L.map((x) => x[1] - base).sort((p, q) => p - q);
+    const jitter = late[Math.min(late.length - 1, Math.floor(late.length * 0.97))];
+    const margin = Math.min(300, Math.max(25, jitter + 10));
+    const target = base + margin;
+    if (playout.delay == null || Math.abs(target - playout.delay) > 1000) playout.delay = target;
+    // grow quickly (a late frame is a visible stall), shrink slowly (no visible speed-up)
+    else if (target > playout.delay) playout.delay += (target - playout.delay) * 0.25;
+    else playout.delay += (target - playout.delay) * 0.01;
+    playout.margin = playout.delay - base;
+  }
+  let shown = null;
+  function present() {
+    requestAnimationFrame(present);
+    if (playout.delay == null || !playout.ready.length) return;
+    const due = performance.now() - playout.delay;
+    let pick = -1;
+    for (let i = 0; i < playout.ready.length; i++) if (playout.ready[i].cap <= due) pick = i;
+    if (pick < 0) return;
+    for (let i = 0; i < pick; i++) release(playout.ready[i]);
+    const f = playout.ready[pick];
+    playout.ready.splice(0, pick + 1);
+    if (f.dl) {
+      show(glCanvas);
+      const r = D.draw(f.dl, frameW, frameH, clearColor);
+      if (waitArt) { waitArt = false; $("startInfo").textContent = "Connected."; $("startBtn").disabled = false; }
+      tele.drawMs += r.ms; tele.drawMax = Math.max(tele.drawMax, r.ms); tele.drawn++; tele.missing += r.missing;
+      stats.drawMs = r.ms; stats.mode = "draw";
+    } else {
+      show(jpegCanvas);
+      ctx2d.drawImage(f.bmp, 0, 0, frameW, frameH);
+      stats.mode = "video";
+    }
+    release(shown); shown = f;
+    // tap-to-glass: the first frame shown after the server applied an input
+    const now = performance.now();
+    for (const [s, t] of sentAt) {
+      if (s <= f.input) { stats.tap = now - t; sentAt.delete(s); }
+    }
+    stats.frames++;
+    tele.shown++;
+    if (tele.lastShown) tele.gapMax = Math.max(tele.gapMax, now - tele.lastShown);
+    tele.lastShown = now;
+    if (now - stats.last > 1000) {
+      const dt = now - stats.last;
+      stats.fps = stats.frames * 1000 / dt;
+      stats.kb = stats.recv ? stats.bytes / stats.recv / 1024 : 0;
+      stats.frames = 0; stats.bytes = 0; stats.recv = 0; stats.last = now;
+      if (stats.show) $("stats").textContent =
+        (stats.mode === "draw" ? `${stats.fps.toFixed(0)} fps  ${stats.kb.toFixed(1)} KB  drawn here ${stats.drawMs.toFixed(1)} ms\nrtt` :
+        `${stats.fps.toFixed(0)} fps  ${stats.kb.toFixed(0)} KB  q${stats.q}\nrtt`) + ` ${stats.rtt.toFixed(0)} ms  buffer ${playout.margin.toFixed(0)} ms\ntap->frame ${stats.tap.toFixed(0)} ms  audio ${audio.ext}`;
+    }
+  }
+  requestAnimationFrame(present);
+
+  // ------------------------------------------------------------------ input
+  let down = false, lastMove = 0;
+  function point(e) {
+    const r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
+  }
+  function sendInput(type, p) {
+    const s = ++seq;
+    sentAt.set(s, performance.now());
+    if (sentAt.size > 50) sentAt.delete(sentAt.keys().next().value);
+    send({ type, x: +p.x.toFixed(4), y: +p.y.toFixed(4), seq: s });
+  }
+  for (const c of [jpegCanvas, glCanvas]) {
+    c.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      audio.unlock();
+      if (down) return;
+      down = true;
+      try { c.setPointerCapture(e.pointerId); } catch (err) {}
+      sendInput("down", point(e));
+    });
+    c.addEventListener("pointermove", (e) => {
+      if (!down) return;
+      const now = performance.now();
+      if (now - lastMove < 33) return;
+      lastMove = now;
+      sendInput("move", point(e));
+    });
+    const up = (e) => { if (!down) return; down = false; sendInput("up", point(e)); };
+    c.addEventListener("pointerup", up);
+    c.addEventListener("pointercancel", up);
+    c.addEventListener("contextmenu", (e) => e.preventDefault());
+  }
+
+  // ------------------------------------------------------------------ screens
+  function fillOptions(o) {
+    const fill = (sel, items) => { sel.innerHTML = ""; for (const it of items) { const op = document.createElement("option"); op.value = it.id; op.textContent = it.name; sel.appendChild(op); } };
+    fill($("optDeck"), o.decks); fill($("optOppDeck"), o.decks); fill($("optLocation"), o.locations);
+  }
+  function showSetup() {
+    $("optOpponent").value = setup.friend ? "friend" : "bot";
+    $("optDeck").value = setup.deck; $("optOppDeck").value = setup.opponentDeck; $("optLocation").value = setup.location;
+    $("optOppDeck").disabled = setup.friend;
+  }
+  function showState() {
+    const b = $("banner");
+    let text = "";
+    if (state.phase === "waiting") {
+      if (state.friend && state.opponent !== "ready") text = state.opponent === "away" ? "Waiting for your friend to open this page" : "Waiting for your friend to tap play";
+      else if (state.ready) text = "Get ready!";
+    }
+    b.textContent = text; b.style.display = text ? "block" : "none";
+    $("menuInfo").textContent = state.friend ? "You are player " + (state.side + 1) + ". Your friend opens the same URL on their phone." : "";
+    if (state.phase === "over") {
+      $("endTitle").textContent = state.result === "win" ? "Victory!" : state.result === "lose" ? "Defeat" : "Draw";
+      setTimeout(() => { if (state.phase === "over") $("endScreen").classList.add("on"); }, 400);
+    } else {
+      $("endScreen").classList.remove("on");
+    }
+  }
+  // the picture: drawn here from draw lists, or video (JPEG) at a quality and frame rate at most
+  // (the server's own settings cap both)
+  const PICTURES = { draw: { mode: "list", quality: 100, fps: 60 }, high: { mode: "jpeg", quality: 100, fps: 60 },
+    medium: { mode: "jpeg", quality: 55, fps: 24 }, low: { mode: "jpeg", quality: 40, fps: 15 } };
+  function picture() {
+    let p = null;
+    try { p = localStorage.getItem("crforge.picture"); } catch (e) {}
+    if (!PICTURES[p]) p = hello && hello.render === "jpeg" ? "high" : "draw";
+    return p;
+  }
+  function sendPicture() {
+    let p = PICTURES[picture()] || PICTURES.draw;
+    if (p.mode === "list" && !canDraw()) p = PICTURES.high;
+    send({ type: "picture", mode: p.mode, quality: p.quality, fps: p.fps });
+  }
+  $("optPicture").value = picture();
+  $("optPicture").addEventListener("change", () => {
+    try { localStorage.setItem("crforge.picture", $("optPicture").value); } catch (e) {}
+    sendPicture();
+  });
+  function newBattle() {
+    const friend = $("optOpponent").value === "friend";
+    send({ type: "new", friend, deck: $("optDeck").value, opponentDeck: $("optOppDeck").value, location: $("optLocation").value });
+    $("menu").classList.remove("on"); $("endScreen").classList.remove("on");
+  }
+  $("optOpponent").addEventListener("change", () => { $("optOppDeck").disabled = $("optOpponent").value === "friend"; });
+  $("startBtn").addEventListener("click", () => {
+    audio.unlock();
+    started = true;
+    $("startScreen").classList.remove("on");
+    send({ type: "start" });
+    if (navigator.wakeLock) navigator.wakeLock.request("screen").catch(() => {});
+  });
+  $("menuBtn").addEventListener("click", () => $("menu").classList.add("on"));
+  $("closeMenu").addEventListener("click", () => $("menu").classList.remove("on"));
+  $("newBtn").addEventListener("click", newBattle);
+  $("rematchBtn").addEventListener("click", newBattle);
+  $("endMenuBtn").addEventListener("click", () => { $("endScreen").classList.remove("on"); $("menu").classList.add("on"); });
+  $("reconnectBtn").addEventListener("click", () => { retry = 0; connect(); });
+  $("statsBtn").addEventListener("click", () => { stats.show = !stats.show; $("stats").style.display = stats.show ? "block" : "none"; });
+  $("soundBtn").addEventListener("click", () => { audio.unlock(); audio.setMuted(!audio.muted); $("soundBtn").textContent = audio.muted ? "Sound off" : "Sound on"; });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      if (navigator.wakeLock && started) navigator.wakeLock.request("screen").catch(() => {});
+      if (!ws) { retry = 0; connect(); }
+    }
+  });
+
+  // ------------------------------------------------------------------ audio
+  // The game's FMOD events as tools/game-art/crforge_art/audio.py plays them: each layer picks one
+  // choice by weight, detuned and attenuated at random; the event's cooldown and instance limit
+  // apply; footsteps, wing flaps and voice lines are thinned; a stack of one event is turned down.
+  const audio = {
+    ctx: null, master: null, musicGain: null, index: null, ext: "ogg", muted: false,
+    buffers: new Map(), lastStart: new Map(), voices: new Map(), musicTrack: null,
+
+    unlock() {
+      if (!this.ctx) {
+        // iOS 16.4+: play as media, so the ring/silent switch does not mute the battle
+        try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch (e) {}
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ctx = new AC();
+        const comp = this.ctx.createDynamicsCompressor();
+        comp.threshold.value = -10; comp.knee.value = 6; comp.ratio.value = 8;
+        comp.attack.value = 0.003; comp.release.value = 0.15;
+        this.master = this.ctx.createGain();
+        this.master.gain.value = this.muted ? 0 : 2.0;
+        this.master.connect(comp); comp.connect(this.ctx.destination);
+        this.musicGain = this.ctx.createGain(); this.musicGain.gain.value = 1; this.musicGain.connect(this.master);
+        // iOS: a silent buffer started inside the gesture unlocks output
+        const b = this.ctx.createBuffer(1, 1, 22050), s = this.ctx.createBufferSource();
+        s.buffer = b; s.connect(this.ctx.destination); s.start(0);
+        this.detectFormat();
+      }
+      if (this.ctx.state !== "running") this.ctx.resume();
+    },
+    setMuted(m) { this.muted = m; if (this.master) this.master.gain.value = m ? 0 : 2.0; },
+
+    async loadIndex() {
+      if (this.index) return;
+      try { this.index = await (await fetch("/audio/index.json" + q)).json(); } catch (e) { this.index = null; }
+      this.detectFormat();
+    },
+    // Ogg Vorbis where the browser decodes it, else AAC the server transcodes (older iOS Safari)
+    async detectFormat() {
+      if (!this.ctx || !this.index || this.formatTried) return;
+      this.formatTried = true;
+      const probe = this.firstSample("ui_battle_general") || this.firstSample("music_jingle_general");
+      if (!probe) return;
+      try {
+        const data = await (await fetch(this.url(probe[0], probe[1], "ogg"))).arrayBuffer();
+        await this.decode(data);
+        this.ext = "ogg";
+      } catch (e) { this.ext = "m4a"; this.buffers.clear(); }
+    },
+    firstSample(bank) { const b = this.index && this.index.banks[bank]; if (!b) return null; const n = Object.keys(b)[0]; return n ? [bank, n] : null; },
+    url(bank, sample, ext) { return "/audio/" + encodeURIComponent(bank) + "/" + encodeURIComponent(sample) + "." + (ext || this.ext) + q; },
+    decode(data) { return new Promise((ok, fail) => { const p = this.ctx.decodeAudioData(data, ok, fail); if (p && p.catch) p.catch(fail); }); },
+    buffer(bank, sample) {
+      const key = bank + "/" + sample + "." + this.ext;
+      let p = this.buffers.get(key);
+      if (!p) {
+        p = fetch(this.url(bank, sample)).then((r) => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); }).then((d) => this.decode(d));
+        p.catch(() => {});
+        this.buffers.set(key, p);
+      }
+      return p;
+    },
+    key(ref) { const p = ref.replace(/^\/+|\/+$/g, "").split("/"); return p.slice(-2).join("/"); },
+    lookup(ref) {
+      const key = this.key(ref), ev = this.index.events;
+      if (ev[key]) return { key, ev: ev[key], bank: key.split("/")[0] };
+      const low = key.toLowerCase().replace(/ /g, "_");
+      for (const k in ev) if (k.toLowerCase().replace(/ /g, "_") === low) return { key, ev: ev[k], bank: k.split("/")[0] };
+      // audio.py's samples_for: the longest matching suffix of the event's name among the bank's samples
+      const [bank, event] = key.split("/");
+      const names = Object.keys(this.index.banks[bank] || {});
+      if (!names.length || !event) return null;
+      const tokens = event.replace(/ /g, "_").split("_");
+      for (let i = 0; i < tokens.length; i++) {
+        const k = tokens.slice(i).join("_");
+        if (k.length < 3) continue;
+        const c = names.filter((s) => s === k || s.startsWith(k)).sort();
+        if (c.length) return { key, bank, ev: { v: -12, cd: 0.05, mi: 3, st: 64, l: [{ s: 0, n: 0, p: 1, c: c.map((s) => [s, 1, 0, 0, 0, 0, 0, 0, 0]) }] } };
+      }
+      return null;
+    },
+    play(ref) {
+      if (!this.ctx || !this.index || this.muted || this.ctx.state !== "running") return;
+      const found = this.lookup(ref);
+      if (!found) return;
+      const { key, ev, bank } = found;
+      const now = this.ctx.currentTime;
+      const footstep = /_(steps|step|wing)$/.test(key);
+      let cd = Math.max(ev.cd || 0, 0.03);
+      if (footstep) cd = Math.max(cd, 0.3); else if (key.endsWith("_vo")) cd = Math.max(cd, 2.0);
+      if (this.lastStart.has(key) && now - this.lastStart.get(key) < cd) return;
+      let active = (this.voices.get(key) || []).filter((v) => v.end > now && !v.stopped);
+      const thin = Math.max(-6, -2 * active.length) + (footstep ? -4 : 0);
+      if (active.length >= (ev.mi || 1e9)) {
+        if (ev.st === 0) return;
+        const oldest = active.reduce((a, b) => (a.t < b.t ? a : b));
+        oldest.stop(now); active = active.filter((v) => v !== oldest);
+      }
+      const voice = { t: now, end: now, stopped: false, nodes: [], stop(at) { this.stopped = true; for (const n of this.nodes) { try { n.g.gain.setTargetAtTime(0, at, 0.01); n.s.stop(at + 0.05); } catch (e) {} } } };
+      for (const layer of ev.l) {
+        if (Math.random() > (layer.p == null ? 1 : layer.p)) continue;
+        const c = this.pick(layer.c);
+        if (!c || !c[0]) continue;
+        const [sample, , vol, pitch, rv, rp, d0, d1, loop] = c;
+        const semis = pitch + (rp ? (Math.random() - 0.5) * rp : 0);
+        const db = (ev.v || 0) + vol + thin - (rv ? Math.random() * rv : 0);
+        const delay = d1 > d0 ? d0 + Math.random() * (d1 - d0) : d0;
+        const requested = performance.now();
+        this.buffer(bank, sample).then((buf) => {
+          // a sample that took too long to arrive is dropped rather than played late
+          if (performance.now() - requested > 350) return;
+          const t0 = Math.max(this.ctx.currentTime, now) + (layer.s || 0) + delay;
+          const s = this.ctx.createBufferSource(), g = this.ctx.createGain();
+          s.buffer = buf; s.playbackRate.value = Math.pow(2, semis / 12);
+          g.gain.value = Math.pow(10, db / 20);
+          s.connect(g); g.connect(this.master);
+          if (loop && layer.n > buf.duration) { s.loop = true; s.start(t0); s.stop(t0 + layer.n); voice.end = Math.max(voice.end, t0 + layer.n); }
+          else { s.start(t0); voice.end = Math.max(voice.end, t0 + buf.duration / s.playbackRate.value); }
+          voice.nodes.push({ s, g });
+        }, () => {});
+      }
+      voice.end = now + 0.5;
+      const list = (this.voices.get(key) || []).filter((v) => v.end > now);
+      list.push(voice); this.voices.set(key, list);
+      this.lastStart.set(key, now);
+    },
+    pick(choices) {
+      let total = 0; for (const c of choices) total += Math.max(c[1], 0);
+      if (total <= 0) return choices[Math.floor(Math.random() * choices.length)];
+      let r = Math.random() * total;
+      for (const c of choices) { r -= Math.max(c[1], 0); if (r <= 0) return c; }
+      return choices[choices.length - 1];
+    },
+    // the battle music: a music event's choices looped as a shuffled playlist; null stops it
+    music(ref, delay) {
+      if (!this.ctx || !this.index) { this.pendingMusic = [ref, delay]; return; }
+      const now = this.ctx.currentTime;
+      if (this.musicTrack) { this.musicTrack.stop(now); this.musicTrack = null; }
+      if (!ref) return;
+      const found = this.lookup(ref);
+      if (!found || !found.ev.l.length) return;
+      const { ev, bank } = found;
+      const choices = found.ev.l[0].c.filter((c) => c[0]);
+      if (!choices.length) return;
+      const order = choices.map((c) => c).sort(() => Math.random() - 0.5);
+      const track = { stopped: false, src: null, g: null, stop(at) { this.stopped = true; if (this.g) { this.g.gain.setTargetAtTime(0, at, 0.15); try { this.src.stop(at + 0.6); } catch (e) {} } } };
+      this.musicTrack = track;
+      let k = 0, at = now + delay;
+      const next = () => {
+        if (track.stopped) return;
+        const c = order[k++ % order.length];
+        this.buffer(bank, c[0]).then((buf) => {
+          if (track.stopped) return;
+          const s = this.ctx.createBufferSource(), g = this.ctx.createGain();
+          s.buffer = buf; g.gain.value = Math.pow(10, ((ev.v || 0) + c[2]) / 20);
+          s.connect(g); g.connect(this.musicGain);
+          const start = Math.max(at, this.ctx.currentTime);
+          s.start(start); at = start + buf.duration;
+          track.src = s; track.g = g;
+          s.onended = next;
+        }, () => {});
+      };
+      next();
+    },
+  };
+
+  setInterval(() => { if (audio.pendingMusic && audio.ctx && audio.index) { const [r, d] = audio.pendingMusic; audio.pendingMusic = null; audio.music(r, d); } }, 500);
+
+  fit();
+  connect();
+})();
+</script>
+</body>
+</html>
