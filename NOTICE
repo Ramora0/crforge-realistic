@@ -1,0 +1,39 @@
+crforge-realistic
+Copyright 2026 the crforge-realistic contributors
+
+This product includes software from crforge (https://github.com/voonhous/crforge),
+Copyright 2025-2026 voonhous, licensed under the Apache License 2.0:
+
+- crforge itself, as the git submodule crforge/ (the battle core this project depends on);
+- the classes in realistic/src/main/java/org/crforge/realistic/bridge (and their tests in
+  realistic/src/test/java/org/crforge/realistic/bridge, and the two replay fixtures in
+  realistic/src/test/resources/replays), copied from crforge's desktop module and changed
+  as README.md ("Relationship to crforge") describes;
+- everything under realistic/, tools/game-art, tools/phone-render and the two documents
+  docs/realistic-rendering.md and docs/phone-server.md, written in the fork Ramora0/crforge
+  (branch realistic-render, commit 7f6d6bcf) on top of crforge and moved here.
+
+Files that came from crforge keep crforge's license header. crforge asks that anyone porting or
+reimplementing its logic put a comment at each ported function or module naming the crforge
+file and the commit they read (see "Porting or reimplementing crforge" in crforge's README.md).
+This is a request, not a condition of the license.
+
+---
+
+Clash Royale is a game created and published by Supercell Oy.
+"Clash Royale", "Supercell", and related names, characters, and imagery are trademarks of
+Supercell Oy. This project is an independent, unofficial fan project for personal, educational
+and research use. It is not affiliated with, endorsed, sponsored or specifically approved by
+Supercell, and Supercell is not responsible for it (Supercell's Fan Content Policy:
+https://supercell.com/en/fan-content-policy/).
+
+This project ships no game data, art, sounds or fonts. Each user extracts them from their own
+installation of the game into a local cache outside the repository (docs/GETTING-ASSETS.md).
+
+---
+
+This project uses LibGDX (https://libgdx.com/), licensed under the Apache License 2.0.
+
+tools/game-art reads the SC2 and SCTX formats with schemas from sc-workshop
+(https://github.com/sc-workshop), MIT-licensed: see
+tools/game-art/crforge_art/schemas/LICENSE-sc-workshop.txt.

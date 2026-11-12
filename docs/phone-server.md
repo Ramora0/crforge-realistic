@@ -2,12 +2,12 @@
 
 The phone server plays crforge battles in a phone's browser, drawn with the game's own art, HUD and sounds ([realistic rendering](realistic-rendering.md)). The battle, the bot and the renderer run on your computer. By default the phone draws the picture itself: the server sends it what the renderer draws, as a list of textured polygons a frame, and the parts of the game's textures they use, and the page draws them with WebGL at the screen's own resolution and sends your taps back ([drawn on the phone](#the-picture-drawn-on-the-phone)). That needs well under 1 Mbit/s once the art is in. The older video stream (JPEG frames drawn on the computer) is still there as an option. You play the bottom side against a built-in bot, or against a friend on a second phone.
 
-It needs the art cache of [realistic rendering](realistic-rendering.md#using-it) (extract it with `--audio` for the sounds) and `ffmpeg` on the `PATH` for iPhones that cannot decode Ogg Vorbis.
+It needs the art cache of [Getting the assets](GETTING-ASSETS.md) (extract it with `--audio` for the sounds) and `ffmpeg` on the `PATH` for iPhones that cannot decode Ogg Vorbis.
 
 ## Starting it
 
 ```bash
-./gradlew :desktop:run -Pcrforge.assetSource=cdn --args="--serve"
+./gradlew :realistic:run -Pcrforge.assetSource=cdn --args="--serve"
 #   [--port 8765] [--lan] [--token X] [--size 720x1560] [--fps 30] [--quality 70]
 #   [--location PvP_royal] [--audio-cache DIR] [--render list|jpeg]
 ```
@@ -75,7 +75,7 @@ It is a sparring partner, not a strong player. The decks list the example replay
 
 ## How it works
 
-`desktop/src/main/java/org/crforge/desktop/server`:
+`realistic/src/main/java/org/crforge/realistic/server`:
 
 | Class | Role |
 |---|---|
@@ -94,7 +94,7 @@ It is a sparring partner, not a strong player. The decks list the example replay
 | `Bot` | the built-in opponent |
 | `FrameEncoder` | GL read-back to JPEG (ImageIO), for video |
 
-`desktop/src/main/resources/org/crforge/desktop/server/index.html` is the page: plain JavaScript, no build step.
+`realistic/src/main/resources/org/crforge/realistic/server/index.html` is the page: plain JavaScript, no build step.
 
 **Video frames.** Each WebSocket binary message is a 20-byte header (type, frame number, tick, the last input applied, the encode time, the JPEG quality, the capture time in server milliseconds) and the JPEG. The page decodes each frame as it arrives and acknowledges it, then shows it on a steady clock: at its capture time plus a playout delay. That delay is the lowest latency of the last 4 s plus a margin covering the jitter (the 97th percentile of how much later frames arrived, 25-300 ms); it grows quickly after a late frame and shrinks slowly. Sounds are held back by the same margin so they stay in step with the picture. The server sends a page at most eight frames ahead of its acknowledgements and skips it otherwise, so a slow link gets fewer frames, not later ones. While a page's window stays full the quality drops by 5 (down to 30), and it climbs back 3 s after the skips stop. Positions are interpolated between ticks, as in the recorder.
 
@@ -108,7 +108,7 @@ It is a sparring partner, not a strong player. The decks list the example replay
 
 The server keeps all the logic: the battle, the bot, the taps, the HUD and the effects. Its renderer runs as for video, but draws into a recording batch (`DrawRecorder`): everything the realistic view, its effects, the HUD, the fonts and the placement overlay draw goes through one `PolygonSpriteBatch`, and each of its flushes (a GL draw call) is recorded as polygons. Nothing reads pixels back and there is no frame buffer compositing, so a frame is fully described by what it draws. The page is told what to draw where and draws it with WebGL (2, else 1), at its own resolution (a 402x874 iPhone screen at 3x: 1206x2622 pixels), with the server's shader maths: libgdx's default, ScDrawer's and EffectDrawer's added colour, HudArt's clamp and grey, the shadows' silhouette, and the same blending.
 
-**What a frame is.** Measured over a whole battle of two bots (`:desktop:phoneRenderBench`, 5,658 frames at 30 fps): 569 polygons and 2,705 vertices a frame on average, 1,285 and 6,456 at most, in 218 of the renderer's draw calls. A polygon is a region of a texture (its texture coordinates, interned and sent once, with its triangulation: a strip, as ScDrawer cuts shapes; a quad, as glyphs are; or triangles), a GL state (interned too), its vertex colours (one or one a vertex) and its vertex positions in 1/16 of a frame pixel. Polygons wholly off the frame are dropped.
+**What a frame is.** Measured over a whole battle of two bots (`:realistic:phoneRenderBench`, 5,658 frames at 30 fps): 569 polygons and 2,705 vertices a frame on average, 1,285 and 6,456 at most, in 218 of the renderer's draw calls. A polygon is a region of a texture (its texture coordinates, interned and sent once, with its triangulation: a strip, as ScDrawer cuts shapes; a quad, as glyphs are; or triangles), a GL state (interned too), its vertex colours (one or one a vertex) and its vertex positions in 1/16 of a frame pixel. Polygons wholly off the frame are dropped.
 
 **Coding.** A frame is sent as the changes from the last frame that page was sent (`DrawCodec`): runs of polygons unchanged, polygons moved (vertex 0's move, then any other vertex's own), recoloured or restated, and new ones (shape repeated from the region's last one where it is the same), then deflated. A frame costs 1.5 KB on average (1.2 KB median, 2.9 KB at the 90th percentile, 9.4 KB at most): 0.36 Mbit/s at 30 fps. Recording a frame takes 0.6 ms on the GL thread and coding it 0.1-0.2 ms on the seat's encoder thread; the server neither rasterizes nor reads back nor compresses images, so a draw-list battle costs it less than video.
 
@@ -116,7 +116,7 @@ The server keeps all the logic: the battle, the bot, the taps, the HUD and the e
 
 **Sent ahead.** A unit's first appearance would hold the stream up while its art arrives, so when a battle is set up the server plays a dry run of it offscreen: the two decks played by two bots for two minutes, drawn into the recorder every third tick and never shown. The patches its frames use (1,240 for the default decks) are sent ahead of need: as fast as the link takes them while the battle waits to start, then at most 1.2 Mbit/s and only while the page acknowledges frames at once and nothing is queued.
 
-**3D units.** With a 3D extraction (`--sc3d`, [realistic rendering §10](realistic-rendering.md#10-3d-assets-sc3d)) the desktop and video draw the hero forms, evolutions and their 3D effects as models. A model reaches the batch as an image the renderer draws into one shared frame buffer, anew each frame, which a draw list could only carry as a fresh texture every frame (a few hundred KB a unit a frame, far over the stream's budget). So while a frame is recorded for draw lists the renderer leaves the models out (`RealisticRenderer.setDrawModels`): the 3D rows, their 3D projectiles and effects are drawn with their 2D stand-in, their bars at the 2D place, as without an extraction; the forms, mounts and effects are still followed from the core's ticks, so the models pick up where they are when the page leaves. The dry run sends that 2D art ahead too. A JPEG page watching the same frame as a draw-list page sees the same 2D stand-in. Without the fallback the page drew the first model image ever read back (the frame buffer read once, its pixels kept as a texture) for every model: the Mega Minion hero showed as pieces of the Hero Tombstone. Measured with the blue example deck's two hero forms (`:desktop:phoneRenderBench --args="OUT 900,1800,2700 720x1560 --sc3d=DIR"`, add `--models` for the old behaviour): 0.36 Mbit/s, 1.5 KB a frame, 2,042 patches, parity 0.32 levels mean difference (0.30-0.35% of pixels off by more than 8), as before 3D; with the models, 9,692 regions instead of 2,095 and parity 0.97-2.2 levels (1-2.3% off). A first battle on a fresh server through `badlink.py` (5 Mbit/s, 20 ms, stalls of 300-1,300 ms) showed 19.8 fps, 22.4 MB in 92 s (frames 3.1 MB, 1.6 KB each; art 19.2 MB); on a plain link 27.2 fps, frames 1.8 KB each, steady 0.55-1.0 Mbit/s.
+**3D units.** With a 3D extraction (`--sc3d`, [realistic rendering §10](realistic-rendering.md#10-3d-assets-sc3d)) the desktop and video draw the hero forms, evolutions and their 3D effects as models. A model reaches the batch as an image the renderer draws into one shared frame buffer, anew each frame, which a draw list could only carry as a fresh texture every frame (a few hundred KB a unit a frame, far over the stream's budget). So while a frame is recorded for draw lists the renderer leaves the models out (`RealisticRenderer.setDrawModels`): the 3D rows, their 3D projectiles and effects are drawn with their 2D stand-in, their bars at the 2D place, as without an extraction; the forms, mounts and effects are still followed from the core's ticks, so the models pick up where they are when the page leaves. The dry run sends that 2D art ahead too. A JPEG page watching the same frame as a draw-list page sees the same 2D stand-in. Without the fallback the page drew the first model image ever read back (the frame buffer read once, its pixels kept as a texture) for every model: the Mega Minion hero showed as pieces of the Hero Tombstone. Measured with the blue example deck's two hero forms (`:realistic:phoneRenderBench --args="OUT 900,1800,2700 720x1560 --sc3d=DIR"`, add `--models` for the old behaviour): 0.36 Mbit/s, 1.5 KB a frame, 2,042 patches, parity 0.32 levels mean difference (0.30-0.35% of pixels off by more than 8), as before 3D; with the models, 9,692 regions instead of 2,095 and parity 0.97-2.2 levels (1-2.3% off). A first battle on a fresh server through `badlink.py` (5 Mbit/s, 20 ms, stalls of 300-1,300 ms) showed 19.8 fps, 22.4 MB in 92 s (frames 3.1 MB, 1.6 KB each; art 19.2 MB); on a plain link 27.2 fps, frames 1.8 KB each, steady 0.55-1.0 Mbit/s.
 
 **Protocol.** On the same WebSocket as video, as binary messages in order (never replaced, unlike video frames):
 

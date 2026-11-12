@@ -1,6 +1,6 @@
 # crforge-art: game-art cache for the realistic renderer
 
-crforge's "realistic rendering" mode draws battles with Clash Royale's own sprites and animations.
+crforge-realistic's renderer draws battles with Clash Royale's own sprites and animations.
 That art belongs to Supercell and is **not** in this repository. This tool builds a local cache of it
 from the files of **your own** Clash Royale installation, and the Java renderer reads that cache.
 
@@ -13,7 +13,10 @@ uv run crforge-art extract --apk ~/cr/base.apk ~/cr/split_*.apk     # APK files
 uv run crforge-art extract --apk ~/Downloads/clash-royale.xapk      # or a .xapk / .apkm bundle
 uv run crforge-art extract --assets ~/cr/assets                     # or an extracted assets/ folder
 uv run crforge-art extract --adb [SERIAL]                           # or pull the APKs from a device
+uv run crforge-art check [--out DIR]                                # is the cache complete?
 ```
+
+New to this? [docs/GETTING-ASSETS.md](../../docs/GETTING-ASSETS.md) walks through it step by step, from enabling USB debugging to a first video.
 
 You must give exactly one source:
 

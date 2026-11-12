@@ -1,46 +1,58 @@
 # Realistic rendering
 
-crforge's desktop module can draw a battle with the game's own art, sounds and HUD in place of the debug visualizer's shapes. The art is never part of this repository: it is extracted from the user's own Clash Royale installation into a local cache, the way the game tables are built from the game's files (see [Game tables](game-tables.md)).
+This repository draws a battle of crforge's simulator with the game's own art, sounds and HUD. The art is never part of this repository: it is extracted from the user's own Clash Royale installation into a local cache ([Getting the assets](GETTING-ASSETS.md)), the way crforge builds its game tables from the game's files (crforge's `docs/game-tables.md`).
 
-<p align="center"><i>Arena, towers, troops, shadows, effects and HUD below are the game's own movie clips, played by the simulator.</i></p>
+<p align="center"><i>Arena, towers, troops, shadows, effects and HUD are the game's own movie clips, played by the simulator. (No pictures here: the art is Supercell's.)</i></p>
 
 ## Using it
 
-1. **Build the art cache** from an installation (once per game version). The tool lives in `tools/game-art` (Python, [uv](https://docs.astral.sh/uv/)):
+The commands run from the repository's root; every `./gradlew` command takes crforge's `-Pcrforge.assetSource=cdn` (README, "Quickstart").
+
+1. **Build the art cache** from your own installation (once per game version), step by step in [Getting the assets](GETTING-ASSETS.md). In short (Python, [uv](https://docs.astral.sh/uv/)):
 
    ```bash
    cd tools/game-art
-   uv run crforge-art extract --adb                        # a phone with the game, over adb
-   uv run crforge-art extract --apk base.apk split_*.apk   # or the APKs (or an .xapk/.apkm bundle)
-   uv run crforge-art extract --assets path/to/assets      # or an already-extracted assets/ folder
-   # add --audio to also decode the battle sounds (needs libvorbis: brew install libvorbis)
+   uv run crforge-art extract --adb --audio                # a phone with the game, over adb
+   uv run crforge-art sc3d --adb                           # the 3D models (hero forms, evolutions)
+   uv run crforge-art check                                # is the cache complete?
    ```
 
-   It writes `~/.crforge/art/<content sha>/` (about 1.3 GB): each SC2 file's scene graph as JSON and its atlases as PNG, the client tables, the arena location files and, with `--audio`, the sounds. Nothing is pre-rendered: the desktop plays the clips itself. `tools/game-art/README.md` has the details and the legal note: the art is Supercell's, for personal use under its Fan Content Policy, and must never be committed or redistributed.
+   It writes `~/.crforge/art/<content sha>/` (about 1.3 GB): each SC2 file's scene graph as JSON and its atlases as PNG, the client tables, the arena location files, the 3D models and, with `--audio`, the sounds. Nothing is pre-rendered: the renderer plays the clips itself. `tools/game-art/README.md` has the details. The art is Supercell's, for personal use under its Fan Content Policy, and must never be committed or redistributed.
 
-2. **In the visualizer**, press **X** (or start it with `--args="--realistic"`) to swap the debug shapes for the game's art. The debug overlays and inspector keep working on top. Press **U** (or start with `--pov`) for the player's view: the HUD of the side at the bottom, as its own phone shows a live battle. The other side's hand and elixir panel goes, and the realistic view puts that side's name in the live top bar at the arena's top left. **F** flips the view, and with it whose view it is.
-
-3. **Record a video** of a replay, offscreen, framed like a phone (1080x2340, 60 fps, HUD included):
+2. **Record a video** of a replay, offscreen, framed like a phone (1080x2340, 60 fps, HUD included):
 
    ```bash
-   ./gradlew :desktop:run --args="--replay examples/replays/ladder.json --record battle.mp4"
+   ./gradlew :realistic:run -Pcrforge.assetSource=cdn \
+       --args="--replay crforge/examples/replays/ladder.json --record battle.mp4"
    #   [--size 1080x2340] [--fps 60] [--from SECONDS] [--seconds N] [--bottom 0|1|blue|red]
    #   [--pov | --player-view] [--location PvP_royal] [--sc3d <folder>|off] [--sc3d-rows <prefixes>|*]
    #   a .png target writes one still at --from
    cd tools/game-art && uv run crforge-art audio ../../battle.mp4   # adds the game's sounds and music
    ```
 
-   Positions are interpolated between the battle's 50 ms ticks, so the video plays smoothly at 60 fps.
+   Positions are interpolated between the battle's 50 ms ticks, so the video plays smoothly at 60 fps. (Each frame is one `1/fps` step of `fps / 20` frames a tick, at least one: below 20 fps the video plays faster than the battle.)
 
-   The Hero Tombstone's rows are drawn with their 3D models when `crforge-art sc3d` has extracted them: by default from `<art cache>/sc3d`, or from the folder `--sc3d` names (`off` keeps the 2D stand-ins); `--sc3d-rows` widens the rows drawn in 3D (row name prefixes, `*` for all, unchecked against the game). See §10.1.
+   The 3D rows (the hero forms, `Ronin`, `MinionGiant`, the evolutions with a model) are drawn with their models when `crforge-art sc3d` has extracted them: by default from `<art cache>/sc3d`, or from the folder `--sc3d` names (`off` keeps the 2D stand-ins); `--sc3d-rows` widens the rows drawn in 3D (row name prefixes, `*` for all, unchecked against the game). See §10.1.
 
    `--bottom` picks whose game view it is: side 0 (`blue`, the default) or side 1 (`red`). The colours are those of the default view; whichever side is at the bottom is drawn blue. The default HUD is the replay HUD, with both sides' hands and elixir. `--pov` records the player's view instead: the bottom side's hand, next card, elixir and ability buttons as they are; no hand, next card, elixir or ability buttons for the top side; and the live battle's top bar (§8, *The player's view*). The opponent's name is the replay's (`battle.avatar<side>.name`), or "Opponent" when the replay names no player.
 
-4. **Play from your phone**: `./gradlew :desktop:run --args="--serve"` streams the realistic view of a live battle to a phone's browser and takes your taps back ([phone server](phone-server.md)).
+   A replay is played on the data version it was recorded on (its capture block's content sha) when crforge's build has made that version's tables, as `crforge-data.lock`'s `compatible=` versions are; otherwise it is refused.
+
+3. **Watch or play in a window**: `--args="--replay FILE"` plays a replay, and no `--replay` starts a live battle against the built-in bot, drawn exactly as the recorder draws it (`RealisticWindow`):
+
+   ```bash
+   ./gradlew :realistic:run -Pcrforge.assetSource=cdn --args="--replay crforge/examples/replays/ladder.json"
+   ./gradlew :realistic:run -Pcrforge.assetSource=cdn        # you (bottom) against the bot
+   #   [--size 540x1170] [--bottom 0|1|blue|red] [--pov] [--location ROW] [--deck ID] [--opponent-deck ID]
+   ```
+
+   **SPACE** pauses, **U** switches between the player's view (the bottom side's own HUD, the default in a live battle) and the replay HUD of both sides, **F** flips a replay's view (whose view it is), **+**/**-** change a replay's speed, **.** steps one tick while paused, **R** starts again and **ESC** quits. In a live battle, click a card (it lifts) and then the arena, or drag the card there; click an ability button to use it. The window plays no sounds. (In crforge's fork this was the debug visualizer's **X** mode, with the debug overlays on top; those stay crforge's.)
+
+4. **Play from your phone**: `./gradlew :realistic:run -Pcrforge.assetSource=cdn --args="--serve"` streams the realistic view of a live battle to a phone's browser and takes your taps back ([phone server](phone-server.md)).
 
 ## How it is drawn
 
-`desktop/src/main/java/org/crforge/desktop/render/art`:
+`realistic/src/main/java/org/crforge/realistic/render/art` (the battle as the core is read into it comes from `org.crforge.realistic.bridge`, crforge's desktop classes copied here):
 
 | Class | Role |
 |---|---|
@@ -53,7 +65,8 @@ crforge's desktop module can draw a battle with the game's own art, sounds and H
 | `BattleHud`, `HudArt`, `HudFonts` | health bars, tower bars, hands, elixir, ability buttons, timer and crowns from the game's UI art; the replay HUD or the player's view (§8) |
 | `CinematicRecorder` | `--record`: the offscreen video and its sound events |
 | `MatchEnd` | crown sounds, the freeze at the match's end and the replay end screen (§9) |
-| `RealisticView` | the visualizer's X mode |
+| `RealisticView` | the realistic view fitted into crforge's debug visualizer's arena (its X mode in the fork); kept for porting, unused by this repository's launcher |
+| `window/RealisticWindow` (beside `render/art`) | the desktop window: a replay or a live battle against the bot, drawn as the recorder draws it |
 | `model/*` (`Sc3dLibrary`, `Glb`, `Rig`, `Asm`, `AnimPlayer`, `ModelCamera`, `UberPbr`, `ModelRenderer`) | 3D units from the sc3d extraction: rig, state machines, the battle camera, the game's `uber_pbr` shader, compositing into the 2D draw order (§10.1) |
 
 The rest of this document is the evidence behind the rules those classes follow.
