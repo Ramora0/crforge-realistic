@@ -25,9 +25,9 @@ import org.crforge.core.battle.data.GameTables;
 import org.crforge.realistic.bridge.BattleAdapter;
 import org.crforge.realistic.bridge.BattleFrame;
 import org.crforge.realistic.bridge.BattleSession;
-import org.crforge.realistic.bridge.ViewOrientation;
 import org.crforge.realistic.bridge.ReplayFile;
 import org.crforge.realistic.bridge.ReplayPlayer;
+import org.crforge.realistic.bridge.ViewOrientation;
 
 /**
  * Plays a replay with the game's art into an offscreen frame and writes it as a video (through

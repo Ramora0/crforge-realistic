@@ -42,7 +42,7 @@ import org.crforge.realistic.render.art.ArtCache;
  * at the frames asked for, the server's own picture (the frame buffer) beside the frame's draw list
  * as a key frame, for the page to replay ({@code tools/phone-render/parity.py}).
  *
- * <p>{@code ./gradlew :desktop:phoneRenderBench -Pcrforge.assetSource=cdn --args="OUT_DIR [frames
+ * <p>{@code ./gradlew :realistic:phoneRenderBench -Pcrforge.assetSource=cdn --args="OUT_DIR [frames
  * 900,1800] [WxH] [--sc3d=DIR] [--models]"}. Needs the art cache and a display (a hidden window).
  * With {@code --sc3d} the blue deck's hero forms (the Mega Minion, the Hero Tombstone) have 3D
  * models; the stream draws their 2D stand-in as the server does, or with {@code --models} their

@@ -1,0 +1,67 @@
+# Build output
+.gradle/
+build/
+out/
+*.class
+.kotlin/
+
+# IDEs and the OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# ---------------------------------------------------------------------------------------------
+# NEVER commit the game's assets or anything made from them (docs/GETTING-ASSETS.md, "Legal").
+# The art cache lives outside the repository (~/.crforge/art); these patterns catch copies, test
+# outputs and recordings that land inside it by mistake.
+# ---------------------------------------------------------------------------------------------
+# installation packages and bundles
+*.apk
+*.apks
+*.xapk
+*.apkm
+*.obb
+# the game's own file formats
+*.sc
+*.sc3d
+*.sctx
+*.scdb
+*.ktx
+*.ktx2
+*.rmat
+*.bank
+*.fsb
+*.csv.lzma
+# what the extractor writes, and art in general
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.glb
+*.gltf
+*.ttf
+*.otf
+*.ogg
+*.m4a
+*.mp3
+*.wav
+# recordings, frames and their sound events
+*.mp4
+*.mov
+*.webm
+*.sounds.jsonl
+# extracted folders and caches, should one be pointed inside the repository
+/assets/
+/art/
+/.crforge/
+/sc3d/
+phone-render-bench/

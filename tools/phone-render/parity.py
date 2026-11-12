@@ -7,7 +7,7 @@ made so far) in the phone page's own player (index.html's crforgeDraw) in a head
 compares the picture with the server's own (its frame buffer), writing both and an amplified
 difference beside them.
 
-    ./gradlew :desktop:phoneRenderBench -Pcrforge.assetSource=cdn --args="OUT 1500,3000"
+    ./gradlew :realistic:phoneRenderBench -Pcrforge.assetSource=cdn --args="OUT 1500,3000"
     uv run --with playwright --with pillow --with numpy tools/phone-render/parity.py OUT \
         [--browser chromium|webkit] [--scale 1]
 """
@@ -24,7 +24,7 @@ from PIL import Image
 from playwright.sync_api import sync_playwright
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-PAGE = ROOT / "desktop/src/main/resources/org/crforge/desktop/server/index.html"
+PAGE = ROOT / "realistic/src/main/resources/org/crforge/realistic/server/index.html"
 CLEAR = [0.11, 0.13, 0.12]
 
 SCRIPT = """

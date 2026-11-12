@@ -21,8 +21,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.crforge.core.battle.data.GameRow;
 import org.crforge.core.battle.data.GameTables;
 import org.crforge.realistic.bridge.BattleFrame;
-import org.crforge.realistic.bridge.ViewOrientation;
 import org.crforge.realistic.bridge.ReplayFile;
+import org.crforge.realistic.bridge.ViewOrientation;
 
 /**
  * The arena as the game composes it: the location row's {@code FileName} names a location file
