@@ -33,6 +33,7 @@ def main():
     a = ap.parse_args()
     recv = []  # (time, bytes, type)
     teles = []
+    inputs = {}  # the server's answers to the taps: played, refused, selected, ...
     with sync_playwright() as pw:
         kind = getattr(pw, a.browser)
         args = ["--use-angle=metal", "--enable-gpu", "--ignore-gpu-blocklist", "--mute-audio"] if a.browser == "chromium" else []
@@ -60,6 +61,11 @@ def main():
                     recv.append((t, len(payload), payload[0]))
                 else:
                     recv.append((t, len(payload.encode()), 0))
+                    if '"type":"input"' in payload:
+                        msg = json.loads(payload)
+                        inputs[msg.get("result")] = inputs.get(msg.get("result"), 0) + 1
+                        if msg.get("message"):
+                            print("server:", msg["result"], msg["message"])
 
             def sent(payload):
                 if isinstance(payload, str) and '"tele"' in payload:
@@ -126,6 +132,7 @@ def main():
               f" median of 2 s windows {statistics.median(gaps)} ms")
     for s in teles[-2:]:
         print("tele:", s[:400])
+    print("taps answered:", ", ".join(f"{k} {v}" for k, v in sorted(inputs.items())) or "none")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@
     crforge-art extract ... --audio                         # also decode the battle sounds
     crforge-art audio battle.mp4                            # mix a recording's sounds into it
     crforge-art sc3d --apk base.apk split_*.apk             # 3D characters -> glTF (<cache>/<sha>/sc3d/)
+    crforge-art check                                       # is the cache complete?
 """
 from __future__ import annotations
 
@@ -42,7 +43,7 @@ def main(argv: list[str] | None = None) -> int:
     ex.add_argument("--force-audio", action="store_true",
                     help="with --audio: decode every bank again (e.g. after a tool update)")
     au = sub.add_parser("audio", help="mix a recording's sound events (VIDEO.sounds.jsonl) into it")
-    au.add_argument("video", help="a video written by the desktop's --record")
+    au.add_argument("video", help="a video written by the launcher's --record")
     au.add_argument("--out", help="output video (default: <video>_audio.mp4)")
     au.add_argument("--cache", default=DEFAULT_OUT, help=f"cache root (default {DEFAULT_OUT})")
     au.add_argument("--no-music", action="store_true", help="sound effects only")
@@ -71,7 +72,15 @@ def main(argv: list[str] | None = None) -> int:
     s3.add_argument("--only", nargs="+", metavar="NAME",
                     help="just these prefabs: a table row (TombstoneHero), a prefab name or path")
     s3.add_argument("--force", action="store_true", help="rebuild models already in the cache")
+    ck = sub.add_parser("check", help="check that the art cache is complete for the renderer")
+    ck.add_argument("--out", default=DEFAULT_OUT,
+                    help=f"cache root, or one content folder (default {DEFAULT_OUT})")
     args = ap.parse_args(argv)
+
+    if args.cmd == "check":
+        from . import check
+
+        return check.main(Path(args.out))
 
     if args.cmd == "sc3d":
         from . import sc3d, sources
