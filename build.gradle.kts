@@ -4,7 +4,7 @@
  */
 
 plugins {
-    java
+    base
     id("com.diffplug.spotless") version "8.11.0"
 }
 
@@ -39,7 +39,9 @@ extra["crforge.builtTablesRoot"] = "$cacheRoot/tables"
 spotless {
     kotlinGradle {
         target("*.gradle.kts", "realistic/*.gradle.kts")
-        ktlint().editorConfigOverride(mapOf("ktlint_standard_max-line-length" to "disabled"))
+        // as crforge: its Gradle scripts are not reformatted, only kept tidy
+        trimTrailingWhitespace()
+        endWithNewline()
     }
 }
 
