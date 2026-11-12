@@ -692,9 +692,10 @@ public final class BattleHud implements Disposable {
           b = merge(b, art.bounds(unit.scene, unit.topExport, 0, HudArt.NONE));
         }
       } else {
-        int id = unit.animation("idle", 5);
-        if (id < 0) id = unit.anyExport;
-        if (id >= 0) b = art.bounds(unit.scene, id, 0, HudArt.NONE);
+        b = idleBounds(art, unit);
+        if (b == null && unit.anyExport >= 0) {
+          b = art.bounds(unit.scene, unit.anyExport, 0, HudArt.NONE);
+        }
       }
       if (b != null) {
         top = b[1] * unit.scale;
@@ -702,6 +703,23 @@ public final class BattleHud implements Disposable {
       }
     }
     return new BarPlace(barClass, top, bottom, offBlue, offRed);
+  }
+
+  /**
+   * The bounds of a unit's idle pose that its {@code HealthBarOffsetY} is measured from: every
+   * facing's {@code idle1} export at its first frame, merged, so the top is the tallest facing's
+   * (INFERRED, docs §8 Health bars: the rows with a positive offset, Knight 28, Super Knight 35,
+   * Champion Guard 30, Dark Witch 20, hold a weapon over their head only when facing away, and
+   * their offsets bring that top down to the others' heads; measured from the side view alone, the
+   * Knight's bar stood at its waist). Null when the unit has no idle clip.
+   */
+  static float[] idleBounds(HudArt art, VisualLookup.Unit unit) {
+    float[] b = null;
+    for (int d = 1, n = unit.directions("idle"); d <= n; d++) {
+      int id = unit.animation("idle", d);
+      if (id >= 0) b = merge(b, art.bounds(unit.scene, id, 0, HudArt.NONE));
+    }
+    return b;
   }
 
   /**
