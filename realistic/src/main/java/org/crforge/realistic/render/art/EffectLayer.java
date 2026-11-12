@@ -2103,6 +2103,20 @@ public final class EffectLayer {
     }
   }
 
+  /**
+   * A particle's clip frame at {@code age} seconds: looped where its emitter says {@code
+   * LoopParticleClip}, unless the clip itself is labelled {@code playOnce} (frame 0), which wins
+   * and holds its last frame (DATA: the labels; INFERRED: their precedence). The Arrows' and the
+   * Princess's stuck arrows ({@code Arrows_Hit_Ground}, {@code Princess_arrow_hit_ground}) are such
+   * clips: a 12-frame wobble at 60 fps that settles, which looped made every arrow quiver for its
+   * whole 1.5-1.9 s life.
+   */
+  static int particleFrame(EffectDefs.Sprite sp, boolean loopClip, float age) {
+    if (sp.frames() <= 1) return 0;
+    int frame = (int) (age * sp.fps());
+    return loopClip && !sp.playOnce() ? frame : Math.min(sp.frames() - 1, frame);
+  }
+
   private void drawParticle(
       ScDrawer drawer,
       ArtProjection proj,
@@ -2122,10 +2136,7 @@ public final class EffectLayer {
     float s = (p.s0 + (p.s1 - p.s0) * k) * ppdu;
     if (Math.abs(s) < 1e-3f) return;
     EffectDefs.Sprite sp = p.sprite;
-    int frame;
-    if (sp.frames() <= 1) frame = 0;
-    else if (em.loopClip) frame = (int) (p.age * sp.fps());
-    else frame = Math.min(sp.frames() - 1, (int) (p.age * sp.fps()));
+    int frame = particleFrame(sp, em.loopClip, p.age);
     float wx = proj.x(view, p.ax) + p.x * ppdu;
     float wy = proj.y(view, p.ay) - p.y * ppdu + p.z * ppdu + lift;
     float rot = p.rot;
