@@ -86,6 +86,11 @@
     <option value="medium">Video, balanced: tunnel, good network</option>
     <option value="low">Video, light: phone network, slow tunnel</option>
   </select>
+  <div id="modelsRow"><label for="optModels">3D units, drawn on this phone</label>
+  <select id="optModels">
+    <option value="3d">As 3D models (the default)</option>
+    <option value="2d">As their 2D stand-in</option>
+  </select></div>
   <div class="row"><button class="secondary" id="statsBtn">Stats</button><button class="secondary" id="closeMenu">Close</button></div>
   <p class="muted" id="menuInfo"></p>
 </div></div>
@@ -102,6 +107,808 @@
   <button id="reconnectBtn">Reconnect</button>
 </div></div>
 
+<script>
+"use strict";
+// The 3D models drawn on the phone (docs/phone-server.md, "3D models on the phone"). The server
+// keeps the battle and the models' state machines; each frame's draw list carries, at its place
+// in the draw order, a model draw: the model refs of its parts, each part's clip, time and
+// cross-fade, where it stands and how it is turned and coloured (DrawCodec.java's model section).
+// This samples the clips, poses the skeletons, skins them on the GPU and shades them with the
+// game's uber_pbr (the server's port, UberPbr.java, here in GLSL ES 3.00), each model rendered
+// into a region of one image (an atlas) as the server renders each into its own, then drawn by
+// the draw-list player as the server's batch draws that image. Model files come over HTTP
+// (ModelAssets.java's binary, PNG textures), cached by content.
+window.crforge3d = (() => {
+  let gl = null, ok = false, query = "";
+  const refs = new Map();       // ref id -> { asset, transform: Float32Array(16), shadow, skip: Set }
+  const assets = new Map();     // asset id -> { ready, failed, model, promise }
+  const textures = new Map();   // texture id -> { tex, ready, promise }
+  let scene = null, scenePromise = null;
+  let lit = null, shadowProg = null, LU = {}, SU = {};
+  let fbo = null, atlas = null, depth = null, AW = 2048, AH = 2048;
+  let jointTex = null, jointRows = 0;
+  const JOINTS_MAX = 256;
+  let defaults = null;
+  let SIN = Math.sin(36.8 * Math.PI / 180), COS = Math.cos(36.8 * Math.PI / 180);
+  const stats = { modelMB: 0, textureMB: 0, models: 0, ms: 0, drawn: 0, waiting: 0, scale: 0 };
+  const debug = {};
+
+  // ---------------------------------------------------------------- shaders (UberPbr.java)
+  const SKIN = `
+    in vec3 a_position; in vec3 a_normal; in vec4 a_tangent; in vec2 a_texCoord0; in vec4 a_joints; in vec4 a_weights;
+    uniform mat4 u_mvp; uniform mat4 u_part; uniform bool u_skinned; uniform int u_row; uniform highp sampler2D u_jointTex;
+    mat4 joint(float j) { int x = int(j + 0.5) * 4;
+      return mat4(texelFetch(u_jointTex, ivec2(x, u_row), 0), texelFetch(u_jointTex, ivec2(x + 1, u_row), 0),
+                  texelFetch(u_jointTex, ivec2(x + 2, u_row), 0), texelFetch(u_jointTex, ivec2(x + 3, u_row), 0)); }
+    mat4 placement() {
+      if (!u_skinned) return u_part;
+      mat4 s = mat4(0.0);
+      if (a_weights.x > 0.0) s += a_weights.x * joint(a_joints.x);
+      if (a_weights.y > 0.0) s += a_weights.y * joint(a_joints.y);
+      if (a_weights.z > 0.0) s += a_weights.z * joint(a_joints.z);
+      if (a_weights.w > 0.0) s += a_weights.w * joint(a_joints.w);
+      return u_part * s;
+    }`;
+  const LIT_VS = `#version 300 es
+    precision highp float; precision highp int;` + SKIN + `
+    out vec3 v_worldPos; out vec3 v_worldNormal; out vec4 v_tangent; out vec2 v_texCoord;
+    void main() {
+      mat4 m = placement();
+      vec4 p = m * vec4(a_position, 1.0);
+      v_worldPos = p.xyz;
+      v_worldNormal = normalize(mat3(m) * a_normal);
+      v_tangent = vec4(normalize(mat3(m) * a_tangent.xyz), a_tangent.w);
+      v_texCoord = a_texCoord0;
+      gl_Position = u_mvp * p;
+    }`;
+  const LIT_FS = `#version 300 es
+    precision highp float; precision highp int;
+    uniform sampler2D mraTex; uniform sampler2D normalTex; uniform sampler2D diffuseTex;
+    uniform sampler2D teamColorTex; uniform sampler2D reflectioinTex;
+    uniform float metalness; uniform float roughness; uniform float emissiveStrength;
+    uniform vec4 u_lightDirectionTime; uniform vec4 u_cameraPosition; uniform vec4 u_dirLightColor;
+    uniform vec4 u_sceneAmbientColor; uniform vec4 u_color; uniform vec4 u_clipPlane;
+    uniform vec4 color_mul; uniform vec4 color_add;
+    uniform vec4 u_fresnel; uniform float u_fresnelIor; uniform vec4 u_rim; uniform vec3 u_rimParams; uniform vec3 u_rimDir;
+    in vec3 v_worldPos; in vec3 v_worldNormal; in vec4 v_tangent; in vec2 v_texCoord;
+    out vec4 fragColor;
+    vec3 toLinear(vec3 c) {
+      vec3 lo = c / 12.92;
+      vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+      return mix(hi, lo, vec3(lessThanEqual(c, vec3(0.04045))));
+    }
+    void main() {
+      vec4 orm = texture(mraTex, v_texCoord);
+      float metal = clamp(metalness * orm.b, 0.0, 1.0);
+      float rough = clamp(roughness * orm.g, 0.0, 1.0);
+      float ao = orm.r;
+      vec3 V = normalize(u_cameraPosition.xyz - v_worldPos);
+      vec2 nxy = texture(normalTex, v_texCoord).xy * 2.0 - vec2(1.0);
+      float nz2 = 1.0 - dot(nxy, nxy);
+      float nz = nz2 > 0.0 ? sqrt(nz2) : 0.0;
+      vec3 N = normalize(v_tangent.xyz * nxy.x
+          + cross(v_worldNormal, v_tangent.xyz) * v_tangent.w * nxy.y + v_worldNormal * nz);
+      vec3 L = u_lightDirectionTime.xyz;
+      float NdL = max(dot(N, L), 0.0);
+      float NdH = max(dot(N, normalize(V + L)), 0.0);
+      float NdV = max(dot(V, N), 0.0);
+      vec4 diff = texture(diffuseTex, v_texCoord);
+      vec3 base = toLinear(diff.rgb);
+      float alpha = diff.a;
+      vec4 team = texture(teamColorTex, v_texCoord);
+      vec3 albedo = mix(base, base * u_color.rgb, vec3(team.z));
+      vec3 F0 = mix(vec3(0.04), albedo, vec3(metal));
+      float r2 = rough * rough;
+      float a2 = r2 * r2;
+      float d = ((NdH * a2) - NdH) * NdH + 1.0;
+      float D = a2 / ((3.1415925 * d) * d);
+      float rk = max(rough, 0.0001);
+      float k = (rk * rk) * 0.7978846;
+      float gl = NdL / max(NdL * (1.0 - k) + k, 0.0001);
+      float gv = NdV / max(NdV * (1.0 - k) + k, 0.0001);
+      float om = 1.0 - rough;
+      float f5 = 1.0 - NdV;
+      f5 = f5 * f5 * f5 * f5 * f5;
+      vec3 F = F0 + (vec3(clamp(om, 0.0, F0.x), clamp(om, 0.0, F0.y), clamp(om, 0.0, F0.z)) - F0) * f5;
+      vec3 kD = vec3(1.0) - F;
+      float kM = 1.0 - metal;
+      vec3 R = reflect(V, N);
+      vec2 ruv = vec2(
+          clamp(1.0 - ((atan(R.y, -R.x) + 3.1415925) * 0.15915495), 0.0, 1.0),
+          clamp((atan(R.z, sqrt(R.x * R.x + R.y * R.y)) + 1.5707963) * 0.31830990, 0.0, 1.0));
+      float lod = clamp(rough * 4.0, 0.0, 3.99) * 3.33;
+      vec3 refl = textureLod(reflectioinTex, ruv, lod).xyz;
+      vec3 c = ((albedo * kD * kM + F * (((team.x * (gl * gv)) * D) / ((4.0 * NdV) * NdL + 0.0001)))
+              * NdL) * (u_dirLightColor.xyz * ao)
+          + (u_sceneAmbientColor.xyz * ao) * albedo * kD * kM
+          + ((refl * (team.x * ao)) * F) * u_sceneAmbientColor.w;
+      c = mix(c, albedo * emissiveStrength, vec3(team.y));
+      if (u_fresnel.w >= 0.0) {
+        float cth = abs(NdV);
+        float g2 = u_fresnelIor * u_fresnelIor - 1.0 + cth * cth;
+        float fr = 1.0;
+        if (g2 > 0.0) {
+          float g = sqrt(g2);
+          float gm = g - cth;
+          float gp = g + cth;
+          float q = gm / gp;
+          float q2 = (cth * gp - 1.0) / (cth * gm + 1.0);
+          fr = 0.5 * q * q * (1.0 + q2 * q2);
+        }
+        float fw = fr * u_fresnel.w;
+        c = mix(c, u_fresnel.xyz, vec3(fw));
+        alpha = clamp(alpha + fw, 0.05, 1.0);
+      }
+      if (u_rim.w != 0.0) {
+        float rd = length(u_rimDir);
+        float facing = rd > 0.0001 ? max(dot(u_rimDir / rd, N), 0.0) : 0.0;
+        c += u_rim.xyz * (pow(smoothstep(u_rimParams.y, 1.0, (1.0 - NdV) * (1.0 - facing)),
+            u_rimParams.x) * ((u_rim.w * team.x) * ao));
+      }
+      if (v_worldPos.z < u_clipPlane.w) discard;
+      float a = alpha * color_mul.w;
+      vec3 s1 = sqrt(max(c * color_mul.xyz + color_add.xyz, vec3(0.0)));
+      vec3 s2 = sqrt(s1);
+      vec3 outc = s1 * 0.5851224 + s2 * 0.7831404 - sqrt(s2) * 0.3682627;
+      fragColor = vec4(clamp(outc, 0.0, 1.0) * a, a);
+    }`;
+  const SHADOW_VS = `#version 300 es
+    precision highp float; precision highp int;` + SKIN + `
+    uniform vec4 u_lightDirectionTime;
+    out float v_z;
+    void main() {
+      vec4 p4 = placement() * vec4(a_position, 1.0);
+      vec3 p = p4.xyz;
+      vec3 q = abs(u_lightDirectionTime.z) < 0.001 ? p
+          : p - u_lightDirectionTime.xyz * (p.z / u_lightDirectionTime.z);
+      v_z = p.z;
+      gl_Position = u_mvp * vec4(q.xy, 0.0, 1.0);
+    }`;
+  const SHADOW_FS = `#version 300 es
+    precision highp float;
+    uniform vec4 u_clipPlane; in float v_z; out vec4 fragColor;
+    void main() { float s = step(u_clipPlane.w, v_z); fragColor = vec4(s, 0.0, 0.0, s); }`;
+
+  // the effect shaders (FxShaders.java), the billboard placement on the GPU (FxRenderer.place)
+  const FX_VS = `#version 300 es
+    precision highp float;
+    in vec3 a_position; in vec3 a_normal; in vec2 a_texCoord0;
+    uniform mat4 u_mvp; uniform mat4 u_full; uniform bool u_billboard; uniform mat3 u_basis;
+    out vec3 v_worldPos; out vec3 v_worldNormal; out vec2 v_texCoord;
+    void main() {
+      vec3 q, n;
+      mat3 lin = mat3(u_full);
+      if (u_billboard) {
+        q = u_full[3].xyz + u_basis * (lin * a_position);
+        vec3 ln = lin * a_normal;
+        n = u_basis * (dot(ln, ln) > 0.0 ? normalize(ln) : ln);
+      } else {
+        q = (u_full * vec4(a_position, 1.0)).xyz;
+        vec3 ln = lin * a_normal;
+        n = dot(ln, ln) > 0.0 ? normalize(ln) : ln;
+      }
+      v_worldPos = q; v_worldNormal = n; v_texCoord = a_texCoord0;
+      gl_Position = u_mvp * vec4(q, 1.0);
+    }`;
+  const MASK_FS = `#version 300 es
+    precision highp float;
+    uniform sampler2D mainTex; uniform sampler2D maskTex; uniform sampler2D maskTex2; uniform sampler2D distortionTex; uniform sampler2D dissolveTex;
+    uniform vec4 u_v[10];
+    uniform vec2 disv_speedxy; uniform vec2 main_speedxy; uniform float disv_amount; uniform float disv_edge_hardness;
+    uniform float u_time; uniform vec4 u_defines; uniform float u_mask2; uniform float u_additive; uniform float u_alphaMul;
+    in vec2 v_texCoord; out vec4 fragColor;
+    void main() {
+      vec4 mainTex_UV = u_v[0], maskTex_UV = u_v[1], mask_speedxy_pow_mul = u_v[2], mask_rgba_selector = u_v[3],
+        distortionTex_UV = u_v[4], dist_speedxy_wmain_wmask = u_v[5], dist_rgba_selector = u_v[6], dissolveTex_UV = u_v[7],
+        disv_rgba_selector = u_v[8], mainColor = u_v[9];
+      float dist = 0.0;
+      if (u_defines.x > 0.5) {
+        dist = dot(texture(distortionTex, v_texCoord * distortionTex_UV.xy + distortionTex_UV.zw
+            + dist_speedxy_wmain_wmask.xy * u_time), dist_rgba_selector);
+      }
+      vec2 muv = v_texCoord * mainTex_UV.xy + mainTex_UV.zw + main_speedxy * u_time + vec2(dist * dist_speedxy_wmain_wmask.z);
+      vec4 col = mainColor;
+      if (u_defines.z > 0.5) col.w = col.w * texture(mainTex, muv).x;
+      else col = texture(mainTex, muv) * mainColor;
+      vec2 kuv = v_texCoord * maskTex_UV.xy + maskTex_UV.zw + mask_speedxy_pow_mul.xy * u_time + vec2(dist * dist_speedxy_wmain_wmask.w);
+      float m = dot(texture(maskTex, kuv), mask_rgba_selector);
+      if (u_mask2 < 0.5) m = max(m, 0.001);
+      col.w = col.w * clamp(pow(m, mask_speedxy_pow_mul.z) * mask_speedxy_pow_mul.w, 0.0, 1.0);
+      if (u_defines.y > 0.5) {
+        float d = dot(texture(dissolveTex, v_texCoord * dissolveTex_UV.xy + dissolveTex_UV.zw + disv_speedxy * u_time), disv_rgba_selector);
+        float s = smoothstep(disv_edge_hardness, 1.0 - disv_edge_hardness, clamp(d + 1.0 - disv_amount * 2.0, 0.0, 1.0));
+        if (u_defines.w > 0.5) s = mix(s, 1.0, texture(maskTex2, v_texCoord).x);
+        col.w = col.w * s;
+      }
+      float a = max(col.w * u_alphaMul, 0.0);
+      if (u_additive < 0.5) a = min(a, 1.0);
+      vec3 rgb = max(col.xyz, vec3(0.0)) * a;
+      fragColor = vec4(rgb, u_additive > 0.5 ? 0.0 : a);
+    }`;
+  const FRESNEL_FS = `#version 300 es
+    precision highp float;
+    uniform vec4 mainColor; uniform vec4 fnl_color; uniform float fnl_power; uniform float fnl_int;
+    uniform vec4 u_cameraPosition; uniform float u_additive; uniform float u_alphaMul;
+    in vec3 v_worldPos; in vec3 v_worldNormal; in vec2 v_texCoord; out vec4 fragColor;
+    vec3 lin(vec3 c) { return c * 0.012522878 + c * 0.6821711 * c + c * 0.305306 * c * c; }
+    void main() {
+      vec3 V = normalize(u_cameraPosition.xyz - v_worldPos);
+      float f = exp2(fnl_power * log2(max(1.0 - max(dot(normalize(v_worldNormal), V), 0.0), 0.0001))) * fnl_int;
+      vec3 s1 = sqrt(max(lin(mainColor.xyz) + lin(fnl_color.xyz) * f, vec3(0.0)));
+      vec3 s2 = sqrt(s1);
+      vec3 c = s1 * 0.5851224 + s2 * 0.7831404 - sqrt(s2) * 0.3682627;
+      float a = clamp(fnl_color.w * u_alphaMul, 0.0, 1.0);
+      fragColor = vec4(max(c, vec3(0.0)) * a, u_additive > 0.5 ? 0.0 : a);
+    }`;
+  let maskProg = null, MU = {}, fresProg = null, FU = {};
+
+  function program(vs, fs, names) {
+    const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+    const p = gl.createProgram();
+    gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+    ["a_position", "a_normal", "a_tangent", "a_texCoord0", "a_joints", "a_weights"].forEach((n, i) => gl.bindAttribLocation(p, i, n));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    const U = {};
+    for (const n of names) U[n] = gl.getUniformLocation(p, n);
+    return [p, U];
+  }
+
+  function solid(rgba) {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(rgba));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    return t;
+  }
+
+  // Compiles the shaders and makes the atlas (WebGL 2 only): at page load, so a battle does not
+  // wait for them. Returns whether models can be drawn.
+  function init(context, q) {
+    gl = context; query = q || ""; ok = false;
+    if (!(typeof WebGL2RenderingContext !== "undefined" && gl instanceof WebGL2RenderingContext)) return false;
+    try {
+      [lit, LU] = program(LIT_VS, LIT_FS, ["u_mvp", "u_part", "u_skinned", "u_row", "u_jointTex", "mraTex", "normalTex", "diffuseTex",
+        "teamColorTex", "reflectioinTex", "metalness", "roughness", "emissiveStrength", "u_lightDirectionTime", "u_cameraPosition",
+        "u_dirLightColor", "u_sceneAmbientColor", "u_color", "u_clipPlane", "color_mul", "color_add", "u_fresnel", "u_fresnelIor",
+        "u_rim", "u_rimParams", "u_rimDir"]);
+      [shadowProg, SU] = program(SHADOW_VS, SHADOW_FS, ["u_mvp", "u_part", "u_skinned", "u_row", "u_jointTex", "u_lightDirectionTime", "u_clipPlane"]);
+      const fxv = ["u_mvp", "u_full", "u_billboard", "u_basis", "u_additive", "u_alphaMul"];
+      [maskProg, MU] = program(FX_VS, MASK_FS, fxv.concat(["mainTex", "maskTex", "maskTex2", "distortionTex", "dissolveTex", "u_v",
+        "disv_speedxy", "main_speedxy", "disv_amount", "disv_edge_hardness", "u_time", "u_defines", "u_mask2"]));
+      [fresProg, FU] = program(FX_VS, FRESNEL_FS, fxv.concat(["mainColor", "fnl_color", "fnl_power", "fnl_int", "u_cameraPosition"]));
+    } catch (e) { console.warn("3D shaders", e); return false; }
+    AW = AH = Math.min(2048, gl.getParameter(gl.MAX_TEXTURE_SIZE));
+    atlas = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, atlas);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, AW, AH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+    depth = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, AW, AH);
+    fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, atlas, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+    const complete = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (!complete) return false;
+    jointTex = gl.createTexture(); jointRows = 0;
+    defaults = { white: solid([255, 255, 255, 255]), black: solid([0, 0, 0, 255]), normal: solid([128, 128, 255, 255]) };
+    // compile now rather than at the first draw
+    gl.useProgram(lit); gl.useProgram(shadowProg); gl.useProgram(maskProg); gl.useProgram(fresProg); gl.useProgram(null);
+    ok = true;
+    return true;
+  }
+
+  // A new set of definitions (a new texture store, a reconnect): the refs are sent again; the
+  // model files stay (they are named by content).
+  function reset() { refs.clear(); }
+
+  // The GL context is gone: everything on the GPU is to be made again.
+  function lost() { assets.clear(); textures.clear(); ok = false; }
+
+  function defineRef(id, asset, transform, shadow, skip) {
+    refs.set(id, { asset, transform, shadow, skip: new Set(skip) });
+    load(asset);
+  }
+
+  // ---------------------------------------------------------------- loading
+  async function inflate(buf) {
+    const ds = new DecompressionStream("deflate-raw");
+    return new Uint8Array(await new Response(new Blob([buf]).stream().pipeThrough(ds)).arrayBuffer());
+  }
+
+  function loadScene() {
+    if (!scenePromise) scenePromise = fetch("/m3d/scene.json" + query).then((r) => r.ok ? r.json() : null).then((s) => {
+      scene = s;
+      if (s && s.tilt) { SIN = Math.sin(s.tilt * Math.PI / 180); COS = Math.cos(s.tilt * Math.PI / 180); }
+    }).catch(() => { scenePromise = null; });
+    return scenePromise;
+  }
+
+  function load(id) {
+    let a = assets.get(id);
+    if (a) return a.promise;
+    a = { ready: false, failed: false, model: null, promise: null };
+    assets.set(id, a);
+    a.promise = (async () => {
+      try {
+        loadScene();
+        const r = await fetch("/m3d/model/" + id + ".bin" + query);
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const z = new Uint8Array(await r.arrayBuffer());
+        stats.modelMB += z.byteLength / 1048576;
+        const m = parse(await inflate(z));
+        await Promise.all(m.textures.map(loadTexture));
+        await loadScene();
+        if (!ok) return;
+        upload(m);
+        a.model = m; a.ready = true; stats.models++;
+      } catch (e) { console.warn("model " + id, e); a.failed = true; }
+    })();
+    return a.promise;
+  }
+
+  function loadTexture(id) {
+    let t = textures.get(id);
+    if (t) return t.promise;
+    t = { tex: null, ready: false, promise: null };
+    textures.set(id, t);
+    t.promise = (async () => {
+      const r = await fetch("/m3d/tex/" + id + ".png" + query);
+      if (!r.ok) throw new Error("texture " + id + ": HTTP " + r.status);
+      const blob = await r.blob();
+      stats.textureMB += blob.size / 1048576;
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.src = url;
+      try { await img.decode(); } finally { URL.revokeObjectURL(url); }
+      if (!ok) return;
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+      t.tex = tex; t.ready = true;
+    })();
+    return t.promise;
+  }
+
+  // The model binary (ModelAssets.build).
+  function parse(b) {
+    const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    let at = 4;
+    const u8 = () => b[at++];
+    const u16 = () => { const v = dv.getUint16(at, true); at += 2; return v; };
+    const i16 = () => { const v = dv.getInt16(at, true); at += 2; return v; };
+    const u32 = () => { const v = dv.getUint32(at, true); at += 4; return v; };
+    const f32 = () => { const v = dv.getFloat32(at, true); at += 4; return v; };
+    const arr = (T, n) => { const bytes = n * T.BYTES_PER_ELEMENT; const a = new T(b.buffer.slice(b.byteOffset + at, b.byteOffset + at + bytes)); at += bytes; return a; };
+    const nodes = u16();
+    const parent = new Int16Array(nodes), rest = new Float32Array(nodes * 10);
+    for (let n = 0; n < nodes; n++) { parent[n] = i16(); for (let k = 0; k < 10; k++) rest[n * 10 + k] = f32(); }
+    const jc = u16();
+    const joints = arr(Uint16Array, jc), invBind = arr(Float32Array, jc * 16);
+    const clips = [];
+    for (let c = u16(); c > 0; c--) {
+      const length = f32(), channels = [];
+      for (let k = u16(); k > 0; k--) {
+        const node = u16(), path = u8(), step = u8() !== 0, keys = u32();
+        const times = arr(Float32Array, keys);
+        let values;
+        if (path === 1) {
+          const q = arr(Int16Array, keys * 4);
+          values = new Float32Array(keys * 4);
+          for (let i = 0; i < q.length; i++) values[i] = q[i] / 32767;
+        } else {
+          const min = [f32(), f32(), f32()], st = [f32(), f32(), f32()];
+          const q = arr(Uint16Array, keys * 3);
+          values = new Float32Array(keys * 3);
+          for (let i = 0; i < q.length; i++) values[i] = min[i % 3] + q[i] * st[i % 3];
+        }
+        channels.push({ node, n: path === 1 ? 4 : 3, path, step, times, values });
+      }
+      clips.push({ length, channels });
+    }
+    const tids = [];
+    for (let t = u16(); t > 0; t--) { const len = u8(); tids.push(String.fromCharCode(...b.subarray(at, at + len))); at += len; }
+    const prims = [];
+    for (let p = u16(); p > 0; p--) {
+      const node = i16(), vc = u32(), ic = u32(), flags = u8();
+      const tex = [0, 0, 0, 0, 0].map(() => { const v = u8(); return v === 255 ? -1 : v; });
+      const params = [f32(), f32(), f32()];
+      const pr = { node, vc, ic, flags, tex, params, skinned: (flags & 8) !== 0 };
+      pr.pos = arr(Float32Array, vc * 3);
+      if (flags & 1) pr.nrm = arr(Int16Array, vc * 3);
+      if (flags & 2) pr.tan = arr(Int16Array, vc * 4);
+      if (flags & 4) pr.uv = arr(Float32Array, vc * 2);
+      if (flags & 8) { pr.joints = arr(Uint8Array, vc * 4); pr.weights = arr(Uint16Array, vc * 4); }
+      pr.idx = (flags & 16) ? arr(Uint32Array, ic) : arr(Uint16Array, ic);
+      prims.push(pr);
+    }
+    return { nodes, parent, rest, joints, invBind, clips, textures: tids, prims };
+  }
+
+  function upload(m) {
+    for (const p of m.prims) {
+      p.vao = gl.createVertexArray();
+      gl.bindVertexArray(p.vao);
+      const buf = (data, loc, size, type, norm) => {
+        const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, size, type, norm, 0, 0);
+      };
+      buf(p.pos, 0, 3, gl.FLOAT, false);
+      if (p.nrm) buf(p.nrm, 1, 3, gl.SHORT, true); else { gl.disableVertexAttribArray(1); gl.vertexAttrib4f(1, 0, 0, 1, 0); }
+      if (p.tan) buf(p.tan, 2, 4, gl.SHORT, true); else { gl.disableVertexAttribArray(2); gl.vertexAttrib4f(2, 1, 0, 0, 1); }
+      if (p.uv) buf(p.uv, 3, 2, gl.FLOAT, false); else { gl.disableVertexAttribArray(3); gl.vertexAttrib4f(3, 0, 0, 0, 0); }
+      if (p.skinned) { buf(p.joints, 4, 4, gl.UNSIGNED_BYTE, false); buf(p.weights, 5, 4, gl.UNSIGNED_SHORT, true); }
+      else { gl.disableVertexAttribArray(4); gl.disableVertexAttribArray(5); }
+      const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, p.idx, gl.STATIC_DRAW);
+      p.itype = p.idx instanceof Uint32Array ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+      gl.bindVertexArray(null);
+      p.pos = p.nrm = p.tan = p.uv = p.joints = p.weights = p.idx = null;  // on the GPU now
+    }
+    const tex = (i, fallback) => { if (i < 0) return fallback; const t = textures.get(m.textures[i]); return t && t.tex ? t.tex : fallback; };
+    for (const p of m.prims) {
+      p.gl = [tex(p.tex[0], defaults.white), tex(p.tex[1], defaults.white), tex(p.tex[2], defaults.normal), tex(p.tex[3], defaults.black), tex(p.tex[4], defaults.black)];
+    }
+    // the posing scratch (Rig.java)
+    const n = m.nodes;
+    m.t = new Float32Array(n * 3); m.r = new Float32Array(n * 4); m.s = new Float32Array(n * 3);
+    m.t2 = new Float32Array(n * 3); m.r2 = new Float32Array(n * 4); m.s2 = new Float32Array(n * 3);
+    m.world = new Float32Array(n * 16); m.done = new Uint8Array(n);
+    // the rest pose's node matrices (an effect model is drawn at rest: FxRenderer)
+    pose(m, null, 0, null, 0, 1);
+    m.restWorld = m.world.slice();
+  }
+
+  // ---------------------------------------------------------------- posing (Rig.java)
+  function restPose(m, t, r, s) {
+    for (let n = 0; n < m.nodes; n++) {
+      const o = n * 10;
+      t[n * 3] = m.rest[o]; t[n * 3 + 1] = m.rest[o + 1]; t[n * 3 + 2] = m.rest[o + 2];
+      r[n * 4] = m.rest[o + 3]; r[n * 4 + 1] = m.rest[o + 4]; r[n * 4 + 2] = m.rest[o + 5]; r[n * 4 + 3] = m.rest[o + 6];
+      s[n * 3] = m.rest[o + 7]; s[n * 3 + 1] = m.rest[o + 8]; s[n * 3 + 2] = m.rest[o + 9];
+    }
+  }
+  function sample(clip, sec, t, r, s) {
+    for (const c of clip.channels) {
+      const times = c.times, n = c.n, len = times.length;
+      const target = c.path === 1 ? r : c.path === 2 ? s : t;
+      const o = c.node * n;
+      // the last key at or before the time (the first when none)
+      let lo = 0, hi = len - 1;
+      while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (times[mid] <= sec) lo = mid; else hi = mid - 1; }
+      const k = lo;
+      let f = 0;
+      if (!c.step && k + 1 < len && times[k + 1] > times[k] && sec > times[k]) f = Math.min(1, (sec - times[k]) / (times[k + 1] - times[k]));
+      const a = k * n, b = Math.min(k + 1, len - 1) * n, v = c.values;
+      if (n === 4) {
+        const dot = v[a] * v[b] + v[a + 1] * v[b + 1] + v[a + 2] * v[b + 2] + v[a + 3] * v[b + 3];
+        const sign = dot < 0 ? -1 : 1;
+        let l = 0;
+        for (let i = 0; i < 4; i++) { const q = v[a + i] + (sign * v[b + i] - v[a + i]) * f; target[o + i] = q; l += q * q; }
+        l = Math.sqrt(l);
+        if (l > 0) for (let i = 0; i < 4; i++) target[o + i] /= l;
+      } else {
+        for (let i = 0; i < n; i++) target[o + i] = v[a + i] + (v[b + i] - v[a + i]) * f;
+      }
+    }
+  }
+  function trs(t, to, r, ro, s, so, out, oo) {
+    const x = r[ro], y = r[ro + 1], z = r[ro + 2], w = r[ro + 3], sx = s[so], sy = s[so + 1], sz = s[so + 2];
+    out[oo] = (1 - 2 * (y * y + z * z)) * sx; out[oo + 1] = 2 * (x * y + z * w) * sx; out[oo + 2] = 2 * (x * z - y * w) * sx; out[oo + 3] = 0;
+    out[oo + 4] = 2 * (x * y - z * w) * sy; out[oo + 5] = (1 - 2 * (x * x + z * z)) * sy; out[oo + 6] = 2 * (y * z + x * w) * sy; out[oo + 7] = 0;
+    out[oo + 8] = 2 * (x * z + y * w) * sz; out[oo + 9] = 2 * (y * z - x * w) * sz; out[oo + 10] = (1 - 2 * (x * x + y * y)) * sz; out[oo + 11] = 0;
+    out[oo + 12] = t[to]; out[oo + 13] = t[to + 1]; out[oo + 14] = t[to + 2]; out[oo + 15] = 1;
+  }
+  function mul(a, ao, b, bo, out, oo) {
+    for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+      let v = 0;
+      for (let k = 0; k < 4; k++) v += a[ao + k * 4 + r] * b[bo + c * 4 + k];
+      out[oo + c * 4 + r] = v;
+    }
+  }
+  const local = new Float32Array(16), tmp = new Float32Array(16);
+  function world(m, n) {
+    if (m.done[n]) return;
+    trs(m.t, n * 3, m.r, n * 4, m.s, n * 3, local, 0);
+    const p = m.parent[n];
+    if (p >= 0) { const l = local.slice(); world(m, p); mul(m.world, p * 16, l, 0, m.world, n * 16); }
+    else m.world.set(local, n * 16);
+    m.done[n] = 1;
+  }
+  // Poses a part (clip and time, cross-faded from another) into m.world.
+  function pose(m, clip, sec, from, fromSec, blend) {
+    restPose(m, m.t, m.r, m.s);
+    if (clip) sample(clip, sec, m.t, m.r, m.s);
+    if (from && blend < 1) {
+      restPose(m, m.t2, m.r2, m.s2);
+      sample(from, fromSec, m.t2, m.r2, m.s2);
+      const a = Math.max(0, Math.min(1, blend));
+      for (let i = 0; i < m.nodes * 3; i++) { m.t[i] = m.t2[i] + (m.t[i] - m.t2[i]) * a; m.s[i] = m.s2[i] + (m.s[i] - m.s2[i]) * a; }
+      for (let n = 0; n < m.nodes; n++) {
+        const o = n * 4, A = m.r2, B = m.r;
+        const dot = A[o] * B[o] + A[o + 1] * B[o + 1] + A[o + 2] * B[o + 2] + A[o + 3] * B[o + 3];
+        const sign = dot < 0 ? -1 : 1;
+        let l = 0; const q = [0, 0, 0, 0];
+        for (let i = 0; i < 4; i++) { q[i] = A[o + i] + (sign * B[o + i] - A[o + i]) * a; l += q[i] * q[i]; }
+        l = Math.sqrt(l);
+        for (let i = 0; i < 4; i++) B[o + i] = l > 0 ? q[i] / l : q[i];
+      }
+    }
+    m.done.fill(0);
+    for (let n = 0; n < m.nodes; n++) world(m, n);
+  }
+
+  // ---------------------------------------------------------------- a frame's models
+  // Whether every model a frame draws is in (for the parity tool and the first frames).
+  function whenReady(f) {
+    const ps = [loadScene()];
+    for (const inst of f.models || []) {
+      for (const r of inst.refs) { const ref = refs.get(r); if (ref) ps.push(load(ref.asset)); }
+      for (const e of inst.fx || []) {
+        const ref = refs.get(e.ref); if (ref) ps.push(load(ref.asset));
+        for (const t of e.textures) if (t) ps.push(loadTexture(t).catch(() => {}));
+      }
+    }
+    return Promise.all(ps);
+  }
+
+  function modelOf(id) { const ref = refs.get(id); if (!ref) return null; const a = assets.get(ref.asset); return a && a.ready ? a.model : null; }
+
+  // Renders the frame's model draws into the atlas, each over its rectangle at `scale` image
+  // pixels a frame pixel (half that for shadows, as the server's PPM_OF_SHADOW). Returns, per
+  // draw, its atlas rectangle in texture coordinates, or null (not drawn: its model is not in).
+  function prepare(f, scale) {
+    const t0 = performance.now();
+    const list = f.models, out = new Array(list.length).fill(null);
+    if (!ok || !scene || !list.length) { stats.waiting += list.length; return out; }
+    // which draws can be drawn, and their image sizes
+    const want = [];
+    let area = 0;
+    for (let i = 0; i < list.length; i++) {
+      const inst = list[i];
+      let ready = true;
+      for (const r of inst.refs) if (!modelOf(r)) { ready = false; const ref = refs.get(r); if (ref) load(ref.asset); }
+      if (!ready || !inst.refs.length) { stats.waiting++; continue; }
+      const k = inst.shadow ? 0.5 : 1;
+      const w = (inst.rect[2] - inst.rect[0]) / 16, h = (inst.rect[3] - inst.rect[1]) / 16;
+      if (!(w > 0 && h > 0)) continue;
+      want.push({ i, w, h, k });
+      area += w * h * k * k;
+    }
+    if (!want.length) return out;
+    // shrink the images when the atlas would not hold them (shelves waste some of it)
+    let s = scale;
+    if (area * s * s > AW * AH * 0.7) s = Math.sqrt(AW * AH * 0.7 / area);
+    let placed = null;
+    for (let tries = 0; tries < 6 && !placed; tries++, s *= 0.85) placed = pack(want, s);
+    if (!placed) return out;
+    stats.scale = s;
+    // the joints of every part, one row a part
+    let rows = 0;
+    for (const p of placed) rows += list[p.i].refs.length;
+    const jdata = new Float32Array(JOINTS_MAX * 4 * 4 * Math.max(1, rows));
+    let row = 0;
+    for (const p of placed) {
+      const inst = list[p.i];
+      p.parts = posed(inst, jdata, row);
+      row += inst.refs.length;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, jointTex);
+    if (rows > jointRows) {
+      jointRows = Math.max(rows, 2 * jointRows, 16);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, JOINTS_MAX * 4, jointRows, 0, gl.RGBA, gl.FLOAT, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    }
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, JOINTS_MAX * 4, rows, gl.RGBA, gl.FLOAT, jdata);
+    // render
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.viewport(0, 0, AW, AH);
+    gl.clearColor(0, 0, 0, 0); gl.clearDepth(1);
+    gl.depthMask(true);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.disable(gl.BLEND); gl.disable(gl.CULL_FACE);
+    gl.depthFunc(gl.LEQUAL);
+    row = 0;
+    for (const p of placed) {
+      const inst = list[p.i];
+      gl.viewport(p.x, p.y, p.pw, p.ph);
+      if (inst.shadow) drawShadow(inst, p, row); else drawLit(inst, p, row);
+      row += inst.refs.length;
+      out[p.i] = [p.x / AW, p.y / AH, (p.x + p.pw) / AW, (p.y + p.ph) / AH];
+    }
+    gl.bindVertexArray(null);
+    gl.disable(gl.DEPTH_TEST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    stats.ms = performance.now() - t0; stats.drawn += placed.length;
+    return out;
+  }
+
+  // Shelves in the atlas, a texel apart; null when they do not fit.
+  function pack(want, s) {
+    const items = want.map((x) => ({ i: x.i, pw: Math.max(1, Math.ceil(x.w * s * x.k)), ph: Math.max(1, Math.ceil(x.h * s * x.k)) }));
+    const order = items.slice().sort((a, b) => b.ph - a.ph);
+    let x = 0, y = 0, shelf = 0;
+    for (const it of order) {
+      if (it.pw + 1 > AW) return null;
+      if (x + it.pw + 1 > AW) { x = 0; y += shelf + 1; shelf = 0; }
+      if (y + it.ph + 1 > AH) return null;
+      it.x = x; it.y = y; x += it.pw + 1; shelf = Math.max(shelf, it.ph);
+    }
+    return items;
+  }
+
+  // Poses the draw's parts (ModelRenderer.pose): each part's placement (the heading's turn, or
+  // its host's bone) and its joints into the joint rows.
+  function posed(inst, jdata, row) {
+    const c = Math.cos(inst.heading), s = Math.sin(inst.heading);
+    const turn = new Float32Array([c, s, 0, 0, -s, c, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    const n = inst.refs.length, parts = new Array(n), mount = new Array(n).fill(null);
+    for (let pi = 0; pi < n; pi++) {
+      const ref = refs.get(inst.refs[pi]), m = modelOf(inst.refs[pi]);
+      const clip = inst.clip[pi] > 0 ? m.clips[inst.clip[pi] - 1] : null;
+      const from = inst.fromClip[pi] > 0 ? m.clips[inst.fromClip[pi] - 1] : null;
+      pose(m, clip, inst.time[pi] / 4096, from, inst.fromTime[pi] / 4096, inst.blend[pi] / 65535);
+      const place = new Float32Array(16);
+      mul(mount[pi] || turn, 0, ref.transform, 0, place, 0);
+      for (let pj = pi + 1; pj < n; pj++) {
+        if (inst.host[pj] !== pi || inst.hostNode[pj] < 0 || inst.hostNode[pj] >= m.nodes) continue;
+        mount[pj] = new Float32Array(16);
+        mul(place, 0, m.world, inst.hostNode[pj] * 16, mount[pj], 0);
+      }
+      // joints: world · inverse bind; an unskinned primitive is placed by its node
+      const o = (row + pi) * JOINTS_MAX * 16;
+      for (let j = 0; j < m.joints.length && j < JOINTS_MAX; j++) mul(m.world, m.joints[j] * 16, m.invBind, j * 16, jdata, o + j * 16);
+      const nodeMats = m.prims.map((p) => {
+        if (p.skinned || p.node < 0) return place;
+        const x = new Float32Array(16); mul(place, 0, m.world, p.node * 16, x, 0); return x;
+      });
+      parts[pi] = { ref, m, place, nodeMats };
+    }
+    return parts;
+  }
+
+  // prefab -> the image's clip space (ModelRenderer.mvp), from the draw's frame-pixel placement.
+  function mvp(inst, p) {
+    const rw = inst.rect[2] - inst.rect[0], rh = inst.rect[3] - inst.rect[1];
+    const kx = inst.kx * 16, ky = inst.ky * 16, v = new Float32Array(16);
+    v[0] = -2 * kx / rw;
+    v[12] = 2 * (inst.x - inst.rect[0]) / rw - 1;
+    v[5] = -2 * ky * COS / rh;
+    v[9] = 2 * ky * SIN / rh;
+    v[13] = 2 * (inst.y - inst.rect[1]) / rh - 1;
+    v[6] = -SIN / 40;
+    v[10] = -COS / 40;
+    v[15] = 1;
+    return v;
+  }
+
+  function drawLit(inst, p, row) {
+    gl.useProgram(lit);
+    gl.enable(gl.DEPTH_TEST);
+    gl.uniformMatrix4fv(LU.u_mvp, false, mvp(inst, p));
+    const L = scene.light, C = scene.camera, Dc = scene.direct, A = scene.ambient, T = inst.blue ? scene.blue : scene.red;
+    gl.uniform4f(LU.u_lightDirectionTime, L[0], L[1], L[2], 0);
+    gl.uniform4f(LU.u_cameraPosition, C[0], C[1], C[2], 1);
+    gl.uniform4f(LU.u_dirLightColor, Dc[0], Dc[1], Dc[2], 1);
+    gl.uniform4f(LU.u_sceneAmbientColor, A[0], A[1], A[2], A[3]);
+    gl.uniform4f(LU.u_color, T[0], T[1], T[2], 1);
+    gl.uniform4f(LU.u_clipPlane, 0, 0, 1, inst.clipPlane ? 0 : -1e6);
+    const cm = inst.colorMul, ca = inst.colorAdd;
+    gl.uniform4f(LU.color_mul, cm[0], cm[1], cm[2], cm[3]);
+    gl.uniform4f(LU.color_add, ca[0], ca[1], ca[2], 0);
+    const names = ["diffuseTex", "mraTex", "normalTex", "teamColorTex", "reflectioinTex"];
+    for (let k = 0; k < 5; k++) gl.uniform1i(LU[names[k]], k + 1);
+    gl.uniform1i(LU.u_jointTex, 0);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, jointTex);
+    for (let pi = 0; pi < p.parts.length; pi++) {
+      const part = p.parts[pi], m = part.m;
+      gl.uniform1i(LU.u_row, row + pi);
+      const glows = inst.glows[pi];
+      for (let i = 0; i < m.prims.length; i++) {
+        if (part.ref.skip.has(i)) continue;
+        const pr = m.prims[i];
+        gl.uniformMatrix4fv(LU.u_part, false, part.nodeMats[i]);
+        gl.uniform1i(LU.u_skinned, pr.skinned ? 1 : 0);
+        const g = glows ? glows[i] : null;
+        if (g) {
+          gl.uniform4f(LU.u_fresnel, g[0], g[1], g[2], g[3]); gl.uniform1f(LU.u_fresnelIor, g[4]);
+          gl.uniform4f(LU.u_rim, g[5], g[6], g[7], g[8]); gl.uniform3f(LU.u_rimParams, g[9], g[10], 0); gl.uniform3f(LU.u_rimDir, g[11], g[12], g[13]);
+        } else { gl.uniform4f(LU.u_fresnel, 0, 0, 0, -1); gl.uniform4f(LU.u_rim, 0, 0, 0, 0); }
+        for (let k = 0; k < 5; k++) { gl.activeTexture(gl.TEXTURE1 + k); gl.bindTexture(gl.TEXTURE_2D, pr.gl[k]); }
+        gl.uniform1f(LU.metalness, pr.params[0]); gl.uniform1f(LU.roughness, pr.params[1]); gl.uniform1f(LU.emissiveStrength, pr.params[2]);
+        gl.bindVertexArray(pr.vao);
+        gl.drawElements(gl.TRIANGLES, pr.ic, pr.itype, 0);
+      }
+    }
+    if (inst.fx && inst.fx.length && !debug.noFx) drawEffects(inst, p);
+    gl.activeTexture(gl.TEXTURE0);
+  }
+
+  // The image's effect draws (FxRenderer.extras' draw): after the lit parts, depth-tested against
+  // them without writing depth, premultiplied over them.
+  function drawEffects(inst, p) {
+    if (debug.fxNoDepth) gl.disable(gl.DEPTH_TEST); else gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL); gl.depthMask(false);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    const mv = mvp(inst, p), basis = new Float32Array([-1, 0, 0, 0, 1, 0, 0, -COS, SIN]);
+    const time = inst.fxTime / 4096, alpha = inst.colorMul[3];
+    const tex = (id) => { if (!id) return defaults.white; const t = textures.get(id); if (!t) { loadTexture(id).catch(() => {}); return defaults.white; } return t.tex || defaults.white; };
+    for (const e of inst.fx) {
+      const m = modelOf(e.ref);
+      if (!m) continue;
+      const fres = e.shader === 2, P = fres ? fresProg : maskProg, U = fres ? FU : MU, u = e.uniforms;
+      gl.useProgram(P);
+      gl.uniformMatrix4fv(U.u_mvp, false, mv);
+      gl.uniformMatrix3fv(U.u_basis, false, basis);
+      gl.uniform1i(U.u_billboard, e.billboard ? 1 : 0);
+      gl.uniform1f(U.u_additive, e.additive ? 1 : 0);
+      gl.uniform1f(U.u_alphaMul, alpha);
+      if (fres) {
+        gl.uniform4f(U.mainColor, u[0], u[1], u[2], u[3]); gl.uniform4f(U.fnl_color, u[4], u[5], u[6], u[7]);
+        gl.uniform1f(U.fnl_power, u[8]); gl.uniform1f(U.fnl_int, u[9]);
+        const C = scene.camera; gl.uniform4f(U.u_cameraPosition, C[0], C[1], C[2], 1);
+      } else {
+        const names = ["mainTex", "maskTex", "maskTex2", "distortionTex", "dissolveTex"];
+        for (let k = 0; k < 5; k++) { gl.activeTexture(gl.TEXTURE1 + k); gl.bindTexture(gl.TEXTURE_2D, tex(e.textures[k])); gl.uniform1i(U[names[k]], k + 1); }
+        gl.uniform4fv(U.u_v, u.subarray(0, 40));
+        gl.uniform2f(U.disv_speedxy, u[40], u[41]); gl.uniform2f(U.main_speedxy, u[42], u[43]);
+        gl.uniform1f(U.disv_amount, u[44]); gl.uniform1f(U.disv_edge_hardness, u[45]);
+        gl.uniform4f(U.u_defines, u[46], u[47], u[48], u[49]);
+        gl.uniform1f(U.u_mask2, e.shader === 1 ? 1 : 0);
+        gl.uniform1f(U.u_time, time);
+      }
+      const full = new Float32Array(16);
+      for (let i = 0; i < m.prims.length; i++) {
+        const pr = m.prims[i];
+        mul(e.matrix, 0, m.restWorld, Math.max(0, pr.node) * 16, full, 0);
+        gl.uniformMatrix4fv(U.u_full, false, full);
+        gl.bindVertexArray(pr.vao);
+        gl.drawElements(gl.TRIANGLES, pr.ic, pr.itype, 0);
+      }
+    }
+    gl.depthMask(true); gl.disable(gl.BLEND);
+  }
+
+  function drawShadow(inst, p, row) {
+    gl.useProgram(shadowProg);
+    gl.disable(gl.DEPTH_TEST);
+    gl.uniformMatrix4fv(SU.u_mvp, false, mvp(inst, p));
+    gl.uniform4f(SU.u_lightDirectionTime, inst.light[0], inst.light[1], inst.light[2], 0);
+    gl.uniform4f(SU.u_clipPlane, 0, 0, 1, inst.clipPlane ? 0 : -1e6);
+    gl.uniform1i(SU.u_jointTex, 0);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, jointTex);
+    for (let pi = 0; pi < p.parts.length; pi++) {
+      const part = p.parts[pi], m = part.m;
+      if (!part.ref.shadow) continue;
+      gl.uniform1i(SU.u_row, row + pi);
+      for (let i = 0; i < m.prims.length; i++) {
+        if (part.ref.skip.has(i)) continue;
+        const pr = m.prims[i];
+        gl.uniformMatrix4fv(SU.u_part, false, part.nodeMats[i]);
+        gl.uniform1i(SU.u_skinned, pr.skinned ? 1 : 0);
+        gl.bindVertexArray(pr.vao);
+        gl.drawElements(gl.TRIANGLES, pr.ic, pr.itype, 0);
+      }
+    }
+  }
+
+  return { init, reset, lost, defineRef, load, whenReady, prepare, stats, debug,
+    get ok() { return ok; }, get atlas() { return atlas; }, get atlasW() { return AW; }, get atlasH() { return AH; } };
+})();
+</script>
 <script>
 "use strict";
 // The draw-list player (docs/phone-server.md, "Drawn on the phone"): the server records what its
@@ -137,6 +944,14 @@ window.crforgeDraw = (() => {
     "    c.rgb = mix(c.rgb, vec3(dot(c.rgb, vec3(0.299, 0.587, 0.114))), u_gray); }\n" +
     "  gl_FragColor = c; }";
 
+  // the 3D models' shadow composite (UberPbr.COMPOSITE_FRAGMENT: shadow_2d_composite's four taps)
+  const SFS = "precision highp float; varying vec4 v_color; varying vec2 v_uv; uniform sampler2D u_tex; uniform vec2 u_offset;\n" +
+    "void main() { float s = texture2D(u_tex, v_uv + u_offset).r + texture2D(u_tex, v_uv + vec2(-u_offset.x, u_offset.y)).r\n" +
+    "  + texture2D(u_tex, v_uv - u_offset).r + texture2D(u_tex, v_uv + vec2(u_offset.x, -u_offset.y)).r;\n" +
+    "  gl_FragColor = v_color * min(s, 1.0); }";
+  let sprog = null, SU = {};
+  const M3 = () => window.crforge3d;
+
   function init(canvas) {
     canvasEl = canvas;
     const opts = { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: true, preserveDrawingBuffer: false, powerPreference: "high-performance" };
@@ -149,7 +964,7 @@ window.crforgeDraw = (() => {
     setup();
     // iOS may drop the GL context (memory, the app in the background): the textures are gone, so
     // the page reconnects and the server sends them again
-    canvas.addEventListener("webglcontextlost", (e) => { e.preventDefault(); lost = true; }, false);
+    canvas.addEventListener("webglcontextlost", (e) => { e.preventDefault(); lost = true; if (M3()) M3().lost(); }, false);
     canvas.addEventListener("webglcontextrestored", () => {
       lost = false; pages.clear(); reset();
       if (!gl2) gl.getExtension("OES_element_index_uint");
@@ -161,12 +976,20 @@ window.crforgeDraw = (() => {
   function setup() {
     const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
       if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
-    prog = gl.createProgram();
-    gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
-    gl.bindAttribLocation(prog, 0, "a_pos"); gl.bindAttribLocation(prog, 1, "a_uv"); gl.bindAttribLocation(prog, 2, "a_color");
-    gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    const link = (vs, fs) => {
+      const p = gl.createProgram();
+      gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+      gl.bindAttribLocation(p, 0, "a_pos"); gl.bindAttribLocation(p, 1, "a_uv"); gl.bindAttribLocation(p, 2, "a_color");
+      gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+      return p;
+    };
+    prog = link(VS, FS);
     for (const u of ["u_scale", "u_tex", "u_add", "u_gray", "u_sil", "u_clamp"]) U[u] = gl.getUniformLocation(prog, u);
+    sprog = link(VS, SFS);
+    for (const u of ["u_scale", "u_tex", "u_offset"]) SU[u] = gl.getUniformLocation(sprog, u);
+    // the 3D models: WebGL 2 only (their shaders are compiled now, not at a unit's first appearance)
+    if (gl2 && M3()) { try { M3().init(gl, new URLSearchParams(location.search).get("t") ? "?t=" + encodeURIComponent(new URLSearchParams(location.search).get("t")) : ""); } catch (e) { console.warn("3D", e); } }
     vbo = gl.createBuffer(); ibo = gl.createBuffer();
     white = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, white);
@@ -186,6 +1009,7 @@ window.crforgeDraw = (() => {
     if (!lost) for (const p of pages.values()) gl.deleteTexture(p.tex);
     pages.clear(); states.clear(); regions.clear(); lastShape = new Map(); reference = null;
     stats.pagesMB = 0;
+    if (M3()) M3().reset();
   }
 
   // A patch: an image (straight alpha) copied into a page at x, y. Art pages are premultiplied
@@ -237,7 +1061,7 @@ window.crforgeDraw = (() => {
     const z = () => { const r = v(); return (r >>> 1) ^ -(r & 1); };
     const i32 = () => { const r = dv.getInt32(at, true); at += 4; return r; };
     const f32 = () => { const r = dv.getFloat32(at, true); at += 4; return r; };
-    const key = (u() & 1) !== 0;
+    const flags = u(), key = (flags & 1) !== 0;
     if (key) lastShape = new Map();
     const ref = key || !reference ? { count: 0 } : reference;
     for (let k = v(); k > 0; k--) {
@@ -316,8 +1140,98 @@ window.crforgeDraw = (() => {
       const last = n - 1;
       prevState = f.state[last]; prevX = f.pos[f.posAt[last]]; prevY = f.pos[f.posAt[last] + 1];
     }
+    // the 3D model draws (DrawCodec.java's model section), each coded against one of the last frame's
+    f.models = [];
+    if (flags & 2) {
+      for (let k = v(); k > 0; k--) {
+        const id = v(), len = v(), asset = String.fromCharCode(...b.subarray(at, at + len));
+        at += len;
+        const t = new Float32Array(16);
+        for (let i = 0; i < 16; i++) t[i] = f32();
+        const shadow = u() !== 0, skip = [];
+        for (let s = v(); s > 0; s--) skip.push(v());
+        if (M3()) M3().defineRef(id, asset, t, shadow, skip);
+      }
+      const prev = ref.models || [];
+      let slot = 0;
+      for (let k = v(); k > 0; k--) {
+        slot += v();
+        const head = v(), r = (head >>> 1) - 1;
+        const m = r >= 0 ? copyModel(prev[r]) : emptyModel();
+        m.slot = slot; m.shadow = (head & 1) !== 0;
+        const mask = v();
+        const rectRel = [0, 1, 2, 3].map((i) => m.rect[i] - (i % 2 ? m.y : m.x));
+        const drawnRel = [0, 1, 2, 3].map((i) => m.drawn[i] - m.rect[i]);
+        if (mask & 1) {
+          const np = v();
+          sizeModel(m, np);
+          for (let p = 0; p < np; p++) { m.refs[p] = v(); m.host[p] = v() - 1; m.hostNode[p] = v() - 1; }
+        }
+        const np = m.refs.length;
+        if (mask & 2) for (let p = 0; p < np; p++) { m.clip[p] = v(); m.fromClip[p] = v(); }
+        if (mask & 4) for (let p = 0; p < np; p++) { m.time[p] += z(); m.fromTime[p] += z(); }
+        if (mask & 8) for (let p = 0; p < np; p++) m.blend[p] = v();
+        if (mask & 16) { m.x += z(); m.y += z(); }
+        if (mask & 32) { m.kx = f32(); m.ky = f32(); }
+        if (mask & 64) m.heading = f32();
+        if (mask & 128) { const fl = u(); m.blue = (fl & 1) !== 0; m.clipPlane = (fl & 2) !== 0; }
+        if (mask & 256) { for (let i = 0; i < 4; i++) m.colorMul[i] = f32(); for (let i = 0; i < 3; i++) m.colorAdd[i] = f32(); }
+        if (mask & 512) for (let i = 0; i < 3; i++) m.light[i] = f32();
+        if (mask & 1024) for (let i = 0; i < 4; i++) rectRel[i] += z();
+        for (let i = 0; i < 4; i++) m.rect[i] = rectRel[i] + (i % 2 ? m.y : m.x);
+        if (mask & 2048) for (let i = 0; i < 4; i++) drawnRel[i] += z();
+        for (let i = 0; i < 4; i++) m.drawn[i] = drawnRel[i] + m.rect[i];
+        if (mask & 4096) for (let i = 0; i < 4; i++) m.tint[i] = f32();
+        if (mask & 8192) {
+          for (let p = 0; p < np; p++) {
+            const len = v();
+            if (!len) { m.glows[p] = null; continue; }
+            const g = new Array(len).fill(null);
+            for (let lit = v(); lit > 0; lit--) { const prim = v(), x = new Float32Array(14); for (let j = 0; j < 14; j++) x[j] = f32(); g[prim] = x; }
+            m.glows[p] = g;
+          }
+        }
+        if (mask & 16384) {
+          const before = m.fx;
+          m.fx = [];
+          for (let e = 0, ne = v(); e < ne; e++) {
+            const how = u();
+            if (how === 2) { m.fx.push(before[e]); continue; }
+            const mat = new Float32Array(16);
+            if (how === 1) { for (let i = 0; i < 16; i++) mat[i] = f32(); m.fx.push(Object.assign({}, before[e], { matrix: mat })); continue; }
+            const ref = v();
+            for (let i = 0; i < 16; i++) mat[i] = f32();
+            const fl = u(), un = new Float32Array(v());
+            for (let i = 0; i < un.length; i++) un[i] = f32();
+            const tex = [];
+            for (let i = 0; i < 5; i++) { const len = v(); tex.push(len ? String.fromCharCode(...b.subarray(at, at + len)) : null); at += len; }
+            m.fx.push({ ref, matrix: mat, shader: fl & 3, additive: (fl & 4) !== 0, billboard: (fl & 8) !== 0, uniforms: un, textures: tex });
+          }
+        }
+        if (mask & 32768) m.fxTime += z();
+        f.models.push(m);
+      }
+    }
     reference = f;
     return f;
+  }
+  function emptyModel() {
+    const m = { slot: 0, shadow: false, x: 0, y: 0, kx: 0, ky: 0, heading: 0, blue: false, clipPlane: false,
+      colorMul: [0, 0, 0, 0], colorAdd: [0, 0, 0], light: [0, 0, 0], rect: [0, 0, 0, 0], drawn: [0, 0, 0, 0], tint: [0, 0, 0, 0],
+      fx: [], fxTime: 0 };
+    sizeModel(m, 0);
+    return m;
+  }
+  function sizeModel(m, n) {
+    for (const k of ["refs", "host", "hostNode", "clip", "time", "fromClip", "fromTime", "blend"]) m[k] = new Array(n).fill(0);
+    m.glows = new Array(n).fill(null);
+  }
+  function copyModel(o) {
+    const m = Object.assign({}, o);
+    for (const k of ["refs", "host", "hostNode", "clip", "time", "fromClip", "fromTime", "blend", "colorMul", "colorAdd", "light", "rect", "drawn", "tint"]) m[k] = o[k].slice();
+    m.glows = o.glows.slice();
+    m.fx = o.fx.slice();
+    return m;
   }
 
   // Draws a decoded frame of w x h frame pixels over the whole canvas, in order, one GL draw per
@@ -326,7 +1240,16 @@ window.crforgeDraw = (() => {
     const t0 = performance.now();
     if (lost) return { ms: 0, draws: 0, verts: 0, missing: 0 };
     for (const p of pages.values()) if (p.dirty) { gl.bindTexture(gl.TEXTURE_2D, p.tex); gl.generateMipmap(gl.TEXTURE_2D); p.dirty = false; }
-    let nv = 0, ni = 0;
+    // the 3D models first, into their atlas: twice the screen's pixels, as the server renders its
+    // images at twice the frame's
+    const models = f.models || [];
+    let placed = null, modelMs = 0;
+    if (models.length && M3() && M3().ok) {
+      const m0 = performance.now();
+      placed = M3().prepare(f, 2 * gl.drawingBufferWidth / w);
+      modelMs = performance.now() - m0;
+    }
+    let nv = 4 * models.length, ni = 6 * models.length;
     for (let i = 0; i < f.count; i++) { nv += f.verts[i]; const r = regions.get(f.region[i]); ni += r.kind === 0 ? 3 * (r.n - 2) : r.kind === 1 ? 6 : r.idx.length; }
     if (nv * 20 > vtx.byteLength) { vtx = new ArrayBuffer(nv * 40); vf = new Float32Array(vtx); vu = new Uint32Array(vtx); }
     if (ni > ind.length) ind = new Uint32Array(ni * 2);
@@ -339,7 +1262,27 @@ window.crforgeDraw = (() => {
     gl.activeTexture(gl.TEXTURE0);
     const runs = [];
     let o = 0, k = 0, base = 0, runTex = -2, runState = -2, runStart = 0;
+    // a model's image (or shadow) as the server's batch draws it: a quad over its rectangle, white
+    // (or the shadow's colour), its run of its own
+    let mi = 0, drawnModels = 0;
+    const emitModels = (upto) => {
+      for (; mi < models.length && models[mi].slot <= upto; mi++) {
+        const pl = placed ? placed[mi] : null, inst = models[mi];
+        if (!pl) continue;
+        if (k > runStart) runs.push(runTex, runState, runStart, k - runStart);
+        const d = inst.drawn, t = inst.tint;
+        const c = inst.shadow ? ((((255 * t[3]) | 0) << 24 | ((255 * t[2]) | 0) << 16 | ((255 * t[1]) | 0) << 8 | ((255 * t[0]) | 0)) & 0xFEFFFFFF) >>> 0 : 0xFEFFFFFF;
+        const q = [d[0], d[1], pl[0], pl[1], d[0], d[3], pl[0], pl[3], d[2], d[3], pl[2], pl[3], d[2], d[1], pl[2], pl[1]];
+        for (let j = 0; j < 4; j++) { vf[o] = q[4 * j]; vf[o + 1] = q[4 * j + 1]; vf[o + 2] = q[4 * j + 2]; vf[o + 3] = q[4 * j + 3]; vu[o + 4] = c; o += 5; }
+        ind[k++] = base; ind[k++] = base + 1; ind[k++] = base + 2; ind[k++] = base + 2; ind[k++] = base + 3; ind[k++] = base;
+        base += 4;
+        runs.push(-1, inst.shadow ? -2 : -1, k - 6, 6);
+        runTex = -3; runState = -3; runStart = k;
+        drawnModels++;
+      }
+    };
     for (let i = 0; i < f.count; i++) {
+      if (mi < models.length) emitModels(i);
       const r = regions.get(f.region[i]), n = f.verts[i], st = f.state[i];
       if (r.tex !== runTex || st !== runState) {
         if (k > runStart) runs.push(runTex, runState, runStart, k - runStart);
@@ -357,6 +1300,7 @@ window.crforgeDraw = (() => {
       else for (let j = 0; j < r.idx.length; j++) ind[k++] = base + r.idx[j];
       base += n;
     }
+    emitModels(Infinity);
     if (k > runStart) runs.push(runTex, runState, runStart, k - runStart);
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vtx, 0, o), gl.STREAM_DRAW);
@@ -367,6 +1311,23 @@ window.crforgeDraw = (() => {
     gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 4, gl.UNSIGNED_BYTE, true, 20, 16);
     let curState = null, curTex = null, missing = 0;
     for (let q = 0; q < runs.length; q += 4) {
+      if (runs[q] === -1) {
+        // a model's image, or its shadow mask through the shadow composite, from the atlas
+        const sh = runs[q + 1] === -2;
+        if (sh) {
+          gl.useProgram(sprog);
+          gl.uniform2f(SU.u_scale, 2 / (w * 16), 2 / (h * 16)); gl.uniform1i(SU.u_tex, 0);
+          gl.uniform2f(SU.u_offset, 0.5 / M3().atlasW, 0.5 / M3().atlasH);
+        } else {
+          gl.uniform3f(U.u_add, 0, 0, 0); gl.uniform1f(U.u_gray, 0); gl.uniform1f(U.u_clamp, 0); gl.uniform1f(U.u_sil, 0);
+        }
+        gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+        gl.bindTexture(gl.TEXTURE_2D, M3().atlas);
+        gl.drawElements(gl.TRIANGLES, runs[q + 3], gl.UNSIGNED_INT, runs[q + 2] * 4);
+        if (sh) gl.useProgram(prog);
+        curState = null; curTex = null;
+        continue;
+      }
       const tex = runs[q], s = states.get(runs[q + 1]);
       const page = tex === 0 ? null : pages.get(tex);
       if (tex !== 0 && !page) { missing++; continue; }
@@ -383,7 +1344,7 @@ window.crforgeDraw = (() => {
       }
       gl.drawElements(gl.TRIANGLES, runs[q + 3], gl.UNSIGNED_INT, runs[q + 2] * 4);
     }
-    return { ms: performance.now() - t0, draws: runs.length / 4, verts: nv, missing };
+    return { ms: performance.now() - t0, draws: runs.length / 4, verts: nv, missing, models: drawnModels, modelMs };
   }
 
   function readPixels() {
@@ -492,6 +1453,7 @@ window.crforgeDraw = (() => {
         playout.ready.length = 0; playout.waiting.length = 0;
         if (picture() === "draw" && !canDraw()) $("menuInfo").textContent = "This browser cannot draw the picture itself (WebGL, DecompressionStream): it gets video.";
         fillOptions(m.options);
+        $("modelsRow").style.display = m.models3d && M && M.ok ? "block" : "none";
         // drawn here: play once the art of the first frame is in (a few MB the first time)
         waitArt = canDraw() && (PICTURES[picture()] || {}).mode === "list" && !started;
         $("startInfo").textContent = waitArt ? "Loading the art..." : "Connected.";
@@ -509,7 +1471,33 @@ window.crforgeDraw = (() => {
       case "input": onInput(m); break;
       case "pong": stats.rtt = performance.now() - m.c; break;
       case "reset": if (canDraw()) D.reset(); break;
+      case "models": preload(m.assets); break;
     }
+  }
+
+  // the 3D models the battle will likely draw (the server's dry run finds them): fetched ahead, and
+  // the start button waits for those told of before it is ready
+  const M = window.crforge3d;
+  let modelsPending = 0;
+  function preload(list) {
+    if (!M || !M.ok || models3d() !== "3d") return;
+    for (const id of list) {
+      modelsPending++;
+      M.load(id).finally(() => { modelsPending--; artReady(); });
+    }
+    artReady();
+  }
+  let artFirstFrame = false;
+  // the start button: once the first frame is drawn here and the models told of are in
+  function artReady() {
+    if (!waitArt) return;
+    if (artFirstFrame && modelsPending <= 0) { waitArt = false; $("startInfo").textContent = "Connected."; $("startBtn").disabled = false; }
+    else if (artFirstFrame) $("startInfo").textContent = "Loading the 3D models: " + (M.stats.modelMB + M.stats.textureMB).toFixed(1) + " MB";
+  }
+  function models3d() {
+    let v = null;
+    try { v = localStorage.getItem("crforge.models"); } catch (e) {}
+    return v === "2d" ? "2d" : "3d";
   }
 
   // sounds wait as long as the picture's jitter buffer holds frames, so they stay in step with it
@@ -534,7 +1522,7 @@ window.crforgeDraw = (() => {
   };
   // what the page sees, sent to the server's log every 2 s
   const tele = { recv: 0, kb: 0, dec: 0, decMax: 0, dropped: 0, shown: 0, gapMax: 0, lastShown: 0, lateMax: 0, t0: performance.now(),
-    listKb: 0, listMax: 0, polys: 0, drawMs: 0, drawMax: 0, drawn: 0, patchKb: 0, missing: 0 };
+    listKb: 0, listMax: 0, polys: 0, drawMs: 0, drawMax: 0, drawn: 0, patchKb: 0, missing: 0, models: 0, modelMs: 0, modelMax: 0 };
   setInterval(() => {
     const dt = (performance.now() - tele.t0) / 1000;
     const L = playout.lat;
@@ -542,7 +1530,9 @@ window.crforgeDraw = (() => {
     const list = stats.mode === "draw" ?
       `draw lists ${(tele.listKb / Math.max(1, tele.recv)).toFixed(1)} KB avg ${tele.listMax.toFixed(1)} max, ${(tele.polys / Math.max(1, tele.recv)).toFixed(0)} polygons; ` +
       `draw ${(tele.drawMs / Math.max(1, tele.drawn)).toFixed(1)} ms avg ${tele.drawMax.toFixed(1)} max; patches ${tele.patchKb.toFixed(0)} KB, ` +
-      `${D.pageCount} pages ${D.stats.pagesMB.toFixed(0)} MB; missing ${tele.missing}; ` : "";
+      `${D.pageCount} pages ${D.stats.pagesMB.toFixed(0)} MB; missing ${tele.missing}; ` +
+      (M && M.ok ? `3D: ${(tele.models / Math.max(1, tele.drawn)).toFixed(1)} draws, ${(tele.modelMs / Math.max(1, tele.drawn)).toFixed(1)} ms avg ${tele.modelMax.toFixed(1)} max, ` +
+        `${M.stats.models} models ${(M.stats.modelMB + M.stats.textureMB).toFixed(1)} MB, waiting ${M.stats.waiting}; ` : "") : "";
     send({ type: "tele", s:
       `[${stats.mode || "?"}] recv ${(tele.recv / dt).toFixed(1)} fps ${(tele.kb * 8 / 1024 / dt).toFixed(2)} Mbit/s; ` + list +
       `decode ${(tele.dec / Math.max(1, tele.recv)).toFixed(1)} ms avg ${tele.decMax.toFixed(0)} max; ` +
@@ -550,7 +1540,8 @@ window.crforgeDraw = (() => {
       `latest arrival +${tele.lateMax.toFixed(0)} ms; buffer ${playout.margin.toFixed(0)} ms; ` +
       `screen ${screen.width}x${screen.height}@${devicePixelRatio} ${navigator.userAgent.match(/OS [0-9_]+|Version\/[0-9.]+/g)}` });
     Object.assign(tele, { recv: 0, kb: 0, dec: 0, decMax: 0, dropped: 0, shown: 0, gapMax: 0, lateMax: 0, t0: performance.now(),
-      listKb: 0, listMax: 0, polys: 0, drawMs: 0, drawMax: 0, drawn: 0, patchKb: 0, missing: 0 });
+      listKb: 0, listMax: 0, polys: 0, drawMs: 0, drawMax: 0, drawn: 0, patchKb: 0, missing: 0, models: 0, modelMs: 0, modelMax: 0 });
+    if (M) M.stats.waiting = 0;
   }, 2000);
   function onFrame(buf) {
     const now = performance.now();
@@ -661,8 +1652,9 @@ window.crforgeDraw = (() => {
     if (f.dl) {
       show(glCanvas);
       const r = D.draw(f.dl, frameW, frameH, clearColor);
-      if (waitArt) { waitArt = false; $("startInfo").textContent = "Connected."; $("startBtn").disabled = false; }
+      if (waitArt) { artFirstFrame = true; artReady(); }
       tele.drawMs += r.ms; tele.drawMax = Math.max(tele.drawMax, r.ms); tele.drawn++; tele.missing += r.missing;
+      tele.models += r.models || 0; tele.modelMs += r.modelMs || 0; tele.modelMax = Math.max(tele.modelMax, r.modelMs || 0);
       stats.drawMs = r.ms; stats.mode = "draw";
     } else {
       show(jpegCanvas);
@@ -764,8 +1756,13 @@ window.crforgeDraw = (() => {
   function sendPicture() {
     let p = PICTURES[picture()] || PICTURES.draw;
     if (p.mode === "list" && !canDraw()) p = PICTURES.high;
-    send({ type: "picture", mode: p.mode, quality: p.quality, fps: p.fps });
+    send({ type: "picture", mode: p.mode, quality: p.quality, fps: p.fps, models: models3d() === "3d" && !!M && M.ok });
   }
+  $("optModels").value = models3d();
+  $("optModels").addEventListener("change", () => {
+    try { localStorage.setItem("crforge.models", $("optModels").value); } catch (e) {}
+    sendPicture();
+  });
   $("optPicture").value = picture();
   $("optPicture").addEventListener("change", () => {
     try { localStorage.setItem("crforge.picture", $("optPicture").value); } catch (e) {}

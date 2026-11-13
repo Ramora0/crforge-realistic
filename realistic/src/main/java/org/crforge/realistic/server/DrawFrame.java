@@ -44,7 +44,14 @@ final class DrawFrame {
   /** Batch flushes (GL draw calls the server's own renderer made). */
   int flushes;
 
+  /**
+   * The 3D model draws the page renders itself, in draw order, each at its slot among the polygons
+   * ({@link ModelInstance}).
+   */
+  java.util.List<ModelInstance> models = new java.util.ArrayList<>();
+
   void clear() {
+    models.clear();
     count = 0;
     colorLen = 0;
     posLen = 0;
@@ -126,7 +133,7 @@ final class DrawFrame {
       if (state[i] != o.state[i] || region[i] != o.region[i]) return false;
       if (!sameColors(i, o, i) || !samePositions(i, o, i)) return false;
     }
-    return true;
+    return models.equals(o.models);
   }
 
   DrawFrame copy() {
@@ -144,6 +151,7 @@ final class DrawFrame {
     f.posLen = posLen;
     f.seen = seen;
     f.flushes = flushes;
+    for (ModelInstance m : models) f.models.add(m.copy());
     return f;
   }
 }

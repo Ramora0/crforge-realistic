@@ -10,7 +10,10 @@ latency; run it through badlink.py for delay spikes.
 
     uv run --with playwright python tools/phone-render/e2e.py http://127.0.0.1:8766/?t=TOKEN \
         [--seconds 60] [--browser chromium|webkit] [--picture draw|high|medium|low] [--throttle 5,100]
-        [--screenshot FILE]
+        [--screenshot FILE] [--deck heroes --opponent-deck heroes2] [--models 3d|2d]
+
+With --deck the page starts a new battle with those decks (the menu's) before tapping to play. The
+3D models' files, fetched over HTTP beside the WebSocket, are counted apart.
 """
 
 import argparse
@@ -30,10 +33,14 @@ def main():
     ap.add_argument("--picture", default="draw")
     ap.add_argument("--throttle", default="")
     ap.add_argument("--screenshot", default="")
+    ap.add_argument("--deck", default="")
+    ap.add_argument("--opponent-deck", default="")
+    ap.add_argument("--models", default="3d")
     a = ap.parse_args()
     recv = []  # (time, bytes, type)
     teles = []
     inputs = {}  # the server's answers to the taps: played, refused, selected, ...
+    http = []  # (time, bytes, url) of the 3D model files
     with sync_playwright() as pw:
         kind = getattr(pw, a.browser)
         args = ["--use-angle=metal", "--enable-gpu", "--ignore-gpu-blocklist", "--mute-audio"] if a.browser == "chromium" else []
@@ -41,7 +48,17 @@ def main():
         ctx = browser.new_context(viewport={"width": 402, "height": 874}, device_scale_factor=3,
                                   is_mobile=a.browser == "chromium", has_touch=True)
         page = ctx.new_page()
-        page.add_init_script(f"try {{ localStorage.setItem('crforge.picture', '{a.picture}'); }} catch (e) {{}}")
+        page.add_init_script(f"try {{ localStorage.setItem('crforge.picture', '{a.picture}'); localStorage.setItem('crforge.models', '{a.models}'); }} catch (e) {{}}")
+
+        def finished(req):
+            if "/m3d/" in req.url:
+                try:
+                    size = req.sizes()["responseBodySize"]
+                except Exception:
+                    size = 0
+                http.append((time.monotonic(), size, req.url))
+
+        page.on("requestfinished", finished)
         # silent: no Web Audio (a headless browser can play through the computer's speakers)
         page.add_init_script("window.AudioContext = undefined; window.webkitAudioContext = undefined;")
         if a.throttle:
@@ -78,9 +95,16 @@ def main():
         page.on("console", lambda m: m.type in ("error", "warning") and print("console:", m.text))
         t0 = time.monotonic()
         page.goto(a.url)
-        page.wait_for_selector("#startBtn:not([disabled])", timeout=120000)
+        if a.deck:
+            page.wait_for_function("document.querySelector('#optDeck').options.length > 0", timeout=60000)
+            page.evaluate("document.querySelector('#menu').classList.add('on')")
+            page.select_option("#optDeck", a.deck)
+            page.select_option("#optOppDeck", a.opponent_deck or a.deck)
+            page.evaluate("document.querySelector('#newBtn').click()")
+            time.sleep(0.5)
+        page.wait_for_selector("#startBtn:not([disabled])", timeout=180000)
         print(f"start button ready after {time.monotonic() - t0:.1f} s")
-        page.click("#startBtn")
+        page.evaluate("document.querySelector('#startBtn').click()")
         tapped = 0
         while time.monotonic() - t0 < a.seconds:
             time.sleep(4)
@@ -93,8 +117,12 @@ def main():
             page.mouse.click(x0 + w * (0.3 + 0.4 * (tapped % 2)), y0 + h * 0.62)
             tapped += 1
         if a.screenshot:
-            page.screenshot(path=a.screenshot)
-        browser.close()
+            page.screenshot(path=a.screenshot, timeout=20000)
+        print(f"played {time.monotonic() - t0:.0f} s, {tapped} plays", flush=True)
+        try:
+            browser.close()
+        except Exception as e:  # a page stuck on a slow link: the numbers are in already
+            print("close:", e)
     # the stream as received
     t_end = recv[-1][0] if recv else t0
     total = sum(b for _, b, _ in recv)
@@ -105,6 +133,11 @@ def main():
         by_type[k][1] += b
     names = {0: "text", 1: "jpeg", 2: "draw list", 3: "patch"}
     print(f"received {total / 1e6:.2f} MB in {t_end - t0:.0f} s")
+    if http:
+        mb = sum(b for _, b, _ in http) / 1e6
+        models = sum(1 for _, _, u in http if "/m3d/model/" in u)
+        texs = sum(1 for _, _, u in http if "/m3d/tex/" in u)
+        print(f"  3D model files over HTTP: {mb:.2f} MB ({models} models, {texs} textures), the last {http[-1][0] - t0:.1f} s in")
     for k, (n, b) in sorted(by_type.items()):
         print(f"  {names.get(k, k)}: {n} messages, {b / 1e6:.2f} MB, {b / max(1, n) / 1024:.1f} KB each")
     frames = [(t, b) for t, b, k in recv if k in (1, 2)]

@@ -292,6 +292,14 @@ public final class RealisticRenderer implements Disposable {
     drawModels = on;
   }
 
+  /**
+   * The 3D models' renderer, or null without an extraction: the phone server sends its draws to the
+   * page instead ({@link ModelRenderer#setRemote}).
+   */
+  public ModelRenderer models() {
+    return models;
+  }
+
   /** Whether 3D models are configured and drawn now. */
   private boolean modelsShown() {
     return models != null && drawModels;

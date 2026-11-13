@@ -121,6 +121,32 @@ final class Seat implements Disposable {
     renderer.setDrawModels(on);
   }
 
+  /** The seat's 3D models sent to the draw lists' pages, or null ({@link #recordModels}). */
+  private ModelRecorder models;
+
+  /** The renderer's 3D extraction, or null without one. */
+  org.crforge.realistic.render.art.model.Sc3dLibrary modelLibrary() {
+    var m = renderer.models();
+    return m == null ? null : m.library();
+  }
+
+  /**
+   * Records the 3D models into the draw lists as model draws the page renders itself
+   * (docs/phone-server.md, "3D models on the phone"), from {@code assets}; null for none.
+   */
+  ModelRecorder recordModels(ModelAssets assets) {
+    var m = renderer.models();
+    if (m == null || recorder == null || assets == null) return null;
+    models = new ModelRecorder(recorder, assets, m.library());
+    m.setRemote(models);
+    return models;
+  }
+
+  /** The recorder of its 3D models, or null. */
+  ModelRecorder modelRecorder() {
+    return models;
+  }
+
   String locationName() {
     return arena.locationName();
   }

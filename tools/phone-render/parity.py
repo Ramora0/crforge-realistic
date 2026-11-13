@@ -35,6 +35,7 @@ async ([frame, patches, w, h, scale, clear]) => {
   document.body.appendChild(c);
   const D = window.crforgeDraw;
   if (!D.init(c)) return { error: 'no WebGL' };
+  if (window.crforge3d && window.PARITY_DEBUG) Object.assign(window.crforge3d.debug, window.PARITY_DEBUG);
   for (const p of patches) {
     const png = new Uint8Array(await (await fetch(p.url)).arrayBuffer());
     const buf = new ArrayBuffer(24 + png.length), dv = new DataView(buf);
@@ -45,11 +46,14 @@ async ([frame, patches, w, h, scale, clear]) => {
   }
   const bin = new Uint8Array(await (await fetch(frame)).arrayBuffer());
   const f = await D.decode(bin);
+  // the 3D models the frame draws: their files, as the page fetches them from the server
+  if (window.crforge3d && f.models && f.models.length) await window.crforge3d.whenReady(f);
   const r = D.draw(f, w, h, clear);
   const px = D.readPixels();
   let s = '';
   for (let i = 0; i < px.px.length; i += 0x8000) s += String.fromCharCode.apply(null, px.px.subarray(i, i + 0x8000));
-  return { w: px.w, h: px.h, data: btoa(s), draw: r, gl2: D.gl2, polys: f.count, ua: navigator.userAgent };
+  return { w: px.w, h: px.h, data: btoa(s), draw: r, gl2: D.gl2, polys: f.count, models: (f.models || []).length,
+    rects: (f.models || []).filter((m) => !m.shadow).map((m) => m.drawn), ua: navigator.userAgent };
 }
 """
 
@@ -59,8 +63,12 @@ def main():
     ap.add_argument("dir", type=pathlib.Path)
     ap.add_argument("--browser", default="chromium")
     ap.add_argument("--scale", type=int, default=1)
+    ap.add_argument("--frames", default="", help="only these frames (comma separated)")
+    ap.add_argument("--debug", default="", help="3D debug flags for the page, as JSON")
     a = ap.parse_args()
     frames = sorted(int(p.stem) for p in a.dir.glob("*.bin"))
+    if a.frames:
+        frames = [int(x) for x in a.frames.split(",")]
     page = PAGE.read_bytes()
     with sync_playwright() as pw:
         kind = getattr(pw, a.browser)
@@ -83,11 +91,20 @@ def main():
                     return r.fulfill(body=page, content_type="text/html")
                 if path in files:
                     return r.fulfill(body=files[path].read_bytes(), content_type="image/png")
+                if path.startswith("/m3d/"):
+                    f = a.dir / path.lstrip("/")
+                    if f.is_file():
+                        kind = "image/png" if path.endswith(".png") else "application/json" if path.endswith(".json") else "application/octet-stream"
+                        return r.fulfill(body=f.read_bytes(), content_type=kind)
+                    return r.fulfill(status=404, body="")
                 if path == "/frame.bin":
                     return r.fulfill(body=(a.dir / f"{k}.bin").read_bytes(), content_type="application/octet-stream")
                 return r.fulfill(status=404, body="")
 
             pg.route("http://parity.local/**", route)
+            pg.on("console", lambda m: print("  [page]", m.text) if m.type in ("warning", "error") else None)
+            if a.debug:
+                pg.add_init_script(f"window.PARITY_DEBUG = {a.debug};")
             pg.goto("http://parity.local/?t=parity")
             res = pg.evaluate(SCRIPT, ["/frame.bin", patches, w, h, a.scale, CLEAR])
             if "error" in res:
@@ -102,11 +119,23 @@ def main():
             B = np.asarray(mine, dtype=np.int16)
             d = np.abs(A - B).max(axis=2)
             Image.fromarray(np.clip(d * 8, 0, 255).astype(np.uint8)).save(a.dir / f"{tag}_diff.png")
+            inside = ""
+            if res.get("rects"):
+                (a.dir / f"{tag}_models.json").write_text(json.dumps(res["rects"]))
+                # the 3D models' own images: the pixels inside their rectangles (frame y is up)
+                mask = np.zeros(d.shape, dtype=bool)
+                for r in res["rects"]:
+                    x0, y0, x1, y1 = (max(0, int(v / 16)) for v in r)
+                    mask[max(0, h - y1):max(0, h - y0), x0:x1] = True
+                if mask.any():
+                    dm = d[mask]
+                    inside = f"; in the model images ({mask.sum()} px): mean {dm.mean():.3f}, >8: {100 * (dm > 8).mean():.3f}%, >32: {100 * (dm > 32).mean():.3f}%"
             print(
                 f"frame {k} [{a.browser}{' x' + str(a.scale) if a.scale != 1 else ''}]: {res['polys']} polygons, "
+                f"{res['draw'].get('models', 0)}/{res['models']} models ({res['draw'].get('modelMs', 0):.1f} ms), "
                 f"{res['draw']['draws']} draws, {res['draw']['ms']:.1f} ms; "
                 f"mean |diff| {d.mean():.3f}, max {d.max()}, pixels off by >8: {100 * (d > 8).mean():.3f}%, "
-                f">32: {100 * (d > 32).mean():.3f}% (webgl2 {res['gl2']})"
+                f">32: {100 * (d > 32).mean():.3f}% (webgl2 {res['gl2']}){inside}"
             )
             ctx.close()
         browser.close()

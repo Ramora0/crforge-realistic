@@ -180,6 +180,18 @@ public final class FxRenderer implements Disposable {
       }
 
       @Override
+      public List<ModelRenderer.RemoteEffect> remoteEffects() {
+        List<ModelRenderer.RemoteEffect> out = new ArrayList<>();
+        for (Draw d : sorted) out.add(remote(d));
+        return out;
+      }
+
+      @Override
+      public float effectTime() {
+        return time;
+      }
+
+      @Override
       public void draw(ModelRenderer.Instance in, Matrix4 mvp) {
         if (sorted.isEmpty() || !ready()) return;
         Gdx.gl.glEnable(GL20.GL_DEPTH_TEST);
@@ -368,6 +380,86 @@ public final class FxRenderer implements Disposable {
       g.meshes.get(i).setVertices(placed.get(i));
       g.meshes.get(i).render(p, GL20.GL_TRIANGLES);
     }
+  }
+
+  /** The mask shaders' vec4 uniforms, in {@link #uniforms}' order. */
+  static final String[] MASK_VEC4 = {
+    "mainTex_UV",
+    "maskTex_UV",
+    "mask_speedxy_pow_mul",
+    "mask_rgba_selector",
+    "distortionTex_UV",
+    "dist_speedxy_wmain_wmask",
+    "dist_rgba_selector",
+    "dissolveTex_UV",
+    "disv_rgba_selector",
+    "mainColor"
+  };
+
+  /**
+   * A material's uniforms as {@link #drawOne} sets them, packed: for {@code vfx_fresnel_simple}
+   * mainColor[4], fnl_color[4], fnl_power, fnl_int; for the mask shaders the {@link #MASK_VEC4} (4
+   * each), disv_speedxy[2], main_speedxy[2], disv_amount, disv_edge_hardness, the defines
+   * (distortion, dissolve, colour as alpha, mask 2 dissolve) and u_mask2.
+   */
+  public static float[] uniforms(FxMaterial m) {
+    float[] o;
+    if ("vfx_fresnel_simple".equals(m.shader())) {
+      o = new float[10];
+      put4(o, 0, m.param("mainColor", 0, 0, 0, 0));
+      put4(o, 4, m.param("fnl_color", 0, 0, 0, 0));
+      o[8] = m.param("fnl_power", 1f)[0];
+      o[9] = m.param("fnl_int", 1f)[0];
+      return o;
+    }
+    boolean mask2 = "vfx_mask2".equals(m.shader());
+    o = new float[50];
+    for (int i = 0; i < MASK_VEC4.length; i++) {
+      String v = MASK_VEC4[i];
+      put4(o, i * 4, m.param(v, v.endsWith("_UV") ? new float[] {1, 1, 0, 0} : new float[4]));
+    }
+    float[] ds = m.param("disv_speedxy", 0, 0);
+    float[] ms = m.param("main_speedxy", 0, 0);
+    o[40] = ds[0];
+    o[41] = ds.length > 1 ? ds[1] : 0;
+    o[42] = ms[0];
+    o[43] = ms.length > 1 ? ms[1] : 0;
+    o[44] = m.param("disv_amount", 0f)[0];
+    o[45] = m.param("disv_edge_hardness", 0f)[0];
+    o[46] = m.textures().containsKey("distortionTex") ? 1f : 0f;
+    o[47] = m.flag("enableDissolve") ? 1f : 0f;
+    o[48] = m.flag("color_as_alpha") ? 1f : 0f;
+    o[49] = mask2 && m.flag("enableMask2Dissolve") ? 1f : 0f;
+    return o;
+  }
+
+  private static void put4(float[] o, int at, float[] v) {
+    for (int i = 0; i < 4; i++) o[at + i] = v.length > i ? v[i] : 0;
+  }
+
+  /** A draw resolved for a remote renderer. */
+  private ModelRenderer.RemoteEffect remote(Draw d) {
+    FxMaterial m = d.material();
+    int shader =
+        "vfx_fresnel_simple".equals(m.shader())
+            ? ModelRenderer.RemoteEffect.FRESNEL
+            : "vfx_mask2".equals(m.shader())
+                ? ModelRenderer.RemoteEffect.MASK2
+                : ModelRenderer.RemoteEffect.MASK;
+    String[] names = {"mainTex", "maskTex", "maskTex2", "distortionTex", "dissolveTex"};
+    Path[] tex = new Path[names.length];
+    for (int i = 0; i < names.length; i++) {
+      String rel = m.textures().get(names[i]);
+      tex[i] = rel == null ? null : library.file(rel);
+    }
+    return new ModelRenderer.RemoteEffect(
+        d.glb(),
+        d.matrix().clone(),
+        shader,
+        m.additive(),
+        m.flag("enableBillboard"),
+        uniforms(m),
+        tex);
   }
 
   private static void set4(ShaderProgram p, String name, float[] v) {

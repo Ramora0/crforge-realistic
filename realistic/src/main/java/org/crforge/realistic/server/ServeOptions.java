@@ -12,7 +12,7 @@ import java.nio.file.Paths;
 /**
  * The phone server's settings, from the launcher's arguments: {@code --serve [--port 8765] [--lan]
  * [--token X] [--size 720x1560] [--fps 30] [--quality 70] [--location PvP_royal] [--audio-cache
- * DIR] [--render list|jpeg]}.
+ * DIR] [--render list|jpeg] [--models 3d|2d]}.
  *
  * @param port the TCP port of the web page, its WebSocket and its sounds
  * @param lan whether to listen on every interface (0.0.0.0) rather than on 127.0.0.1 only
@@ -25,6 +25,8 @@ import java.nio.file.Paths;
  * @param audioCache where sounds transcoded for browsers that cannot decode Ogg Vorbis are kept
  * @param render how a page is sent its picture unless it asks otherwise: {@code list} (draw lists
  *     the page draws itself with WebGL) or {@code jpeg} (frames drawn here, as JPEG)
+ * @param models3d whether draw lists carry the 3D models for the page to render ({@code --models
+ *     3d}, the default with a 3D extraction) rather than the 3D rows' 2D stand-in ({@code 2d})
  */
 public record ServeOptions(
     int port,
@@ -36,7 +38,8 @@ public record ServeOptions(
     int quality,
     String location,
     Path audioCache,
-    String render) {
+    String render,
+    boolean models3d) {
 
   /** Draw lists: the page draws the picture itself. */
   public static final String LIST = "list";
@@ -96,8 +99,23 @@ public record ServeOptions(
     if (!render.equals(LIST) && !render.equals(JPEG)) {
       throw new IllegalArgumentException("--render takes list or jpeg, not " + render);
     }
+    String models = option(args, "--models");
+    if (models == null) models = "3d";
+    if (!models.equals("3d") && !models.equals("2d")) {
+      throw new IllegalArgumentException("--models takes 3d or 2d, not " + models);
+    }
     return new ServeOptions(
-        port, lan, token, width, height, fps, quality, location, audioCache, render);
+        port,
+        lan,
+        token,
+        width,
+        height,
+        fps,
+        quality,
+        location,
+        audioCache,
+        render,
+        models.equals("3d"));
   }
 
   private static boolean flag(String[] args, String name) {

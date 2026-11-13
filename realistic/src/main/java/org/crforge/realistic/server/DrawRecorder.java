@@ -50,6 +50,9 @@ final class DrawRecorder extends PolygonSpriteBatch {
   private boolean rasterize = true;
   private boolean warnedShape;
 
+  /** While on, the batch's draws are made but not recorded (a model image the page renders). */
+  private boolean muted;
+
   DrawRecorder(DrawDefs defs) {
     super(8000);
     this.defs = defs;
@@ -101,7 +104,7 @@ final class DrawRecorder extends PolygonSpriteBatch {
 
   @Override
   public void flush() {
-    if (frame == null) {
+    if (frame == null || muted) {
       super.flush();
       return;
     }
@@ -256,6 +259,45 @@ final class DrawRecorder extends PolygonSpriteBatch {
         frame.point(Math.round((nx + 1f) * sx), Math.round((ny + 1f) * sy));
       }
     }
+  }
+
+  /**
+   * Starts or ends a stretch of draws made but not recorded: a 3D model's image, drawn for the
+   * frame buffer while the page is sent the model itself ({@link ModelRecorder}).
+   */
+  void mute(boolean on) {
+    if (on == muted) return;
+    if (isDrawing()) flush();
+    muted = on;
+  }
+
+  /**
+   * Adds a 3D model draw at this point of the draw order (what is batched is recorded first); the
+   * draw's rectangles are already in frame subpixels.
+   */
+  void model(ModelInstance m) {
+    if (frame == null) return;
+    if (isDrawing()) flush();
+    int w = width * DrawFrame.SUBPIXELS;
+    int h = height * DrawFrame.SUBPIXELS;
+    int[] r = m.drawn;
+    if (r[2] <= 0 || r[3] <= 0 || r[0] >= w || r[1] >= h) return;
+    m.slot = frame.count;
+    frame.models.add(m);
+  }
+
+  /** The frame's size in pixels while recording. */
+  int frameWidth() {
+    return width;
+  }
+
+  int frameHeight() {
+    return height;
+  }
+
+  /** The batch's world-to-clip matrix now (projection times transform). */
+  Matrix4 worldToClip() {
+    return combined.set(getProjectionMatrix()).mul(getTransformMatrix());
   }
 
   /** The state the batch draws in now: its blending, shader kind and the shader's uniforms. */

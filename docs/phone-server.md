@@ -9,7 +9,7 @@ It needs the art cache of [Getting the assets](GETTING-ASSETS.md) (extract it wi
 ```bash
 ./gradlew :realistic:run -Pcrforge.assetSource=cdn --args="--serve"
 #   [--port 8765] [--lan] [--token X] [--size 720x1560] [--fps 30] [--quality 70]
-#   [--location PvP_royal] [--audio-cache DIR] [--render list|jpeg]
+#   [--location PvP_royal] [--audio-cache DIR] [--render list|jpeg] [--models 3d|2d]
 ```
 
 It prints the URLs to open, with the access token:
@@ -25,7 +25,7 @@ Open the URL, tap **Tap to play** (this tap also starts the sound), and play:
 - While you hold a card over the arena, the tiles it cannot go on are shaded red, the tile it lands on is lit, and a ring marks each unit it would place (a spell's circle for a spell). A drop where the card cannot land goes to the nearest legal tile, as in the game; a play the game refuses (not enough elixir) shows the reason.
 - For the first seconds of a battle the game's start cooldown refuses every play, as in the game; the page says so.
 - A champion's or hero's **ability button** appears above the hand while it is on the field; tap it.
-- **Menu**: a new battle (bot or friend, your deck, the bot's deck, the arena), the picture setting (**Drawn on this phone**, the default, or video: **Sharp**, **Balanced**, **Light**), and the stats line (frame rate, frame size, round trip, tap-to-frame time; drawn here, the time a frame takes to draw).
+- **Menu**: a new battle (bot or friend, your deck, the bot's deck, the arena; two hero decks, **Heroes: Knight, Bowler, evolved Giant** and **Heroes: Dark Prince, Balloon, evolved Electro Giant**, show the 3D models), the picture setting (**Drawn on this phone**, the default, or video: **Sharp**, **Balanced**, **Light**), **3D units** (as 3D models, the default, or as their 2D stand-in), and the stats line (frame rate, frame size, round trip, tap-to-frame time; drawn here, the time a frame takes to draw).
 - The first time, **Tap to play** waits until the art the first frame needs is in ("Loading the art: 2.1 MB"): 3.5 MB, a few seconds on Wi-Fi.
 
 | Option | Default | Meaning |
@@ -37,6 +37,7 @@ Open the URL, tap **Tap to play** (this tap also starts the sound), and play:
 | `--fps` | 30 | frames a second at most |
 | `--quality` | 70 | the video's JPEG quality: where it starts, and never exceeds |
 | `--render` | list | a page's picture unless it chooses otherwise in the menu: `list` (drawn on the phone) or `jpeg` (video) |
+| `--models` | 3d | with a 3D extraction, drawn on the phone: `3d` (the page renders the 3D models itself) or `2d` (the 3D rows' 2D stand-in) |
 | `--location` | PvP_royal | the arena of the first battle |
 | `--audio-cache` | `~/.cache/crforge-phone/audio` | where sounds transcoded to AAC are kept |
 
@@ -116,16 +117,52 @@ The server keeps all the logic: the battle, the bot, the taps, the HUD and the e
 
 **Sent ahead.** A unit's first appearance would hold the stream up while its art arrives, so when a battle is set up the server plays a dry run of it offscreen: the two decks played by two bots for two minutes, drawn into the recorder every third tick and never shown. The patches its frames use (1,240 for the default decks) are sent ahead of need: as fast as the link takes them while the battle waits to start, then at most 1.2 Mbit/s and only while the page acknowledges frames at once and nothing is queued.
 
-**3D units.** With a 3D extraction (`--sc3d`, [realistic rendering §10](realistic-rendering.md#10-3d-assets-sc3d)) the desktop and video draw the hero forms, evolutions and their 3D effects as models. A model reaches the batch as an image the renderer draws into one shared frame buffer, anew each frame, which a draw list could only carry as a fresh texture every frame (a few hundred KB a unit a frame, far over the stream's budget). So while a frame is recorded for draw lists the renderer leaves the models out (`RealisticRenderer.setDrawModels`): the 3D rows, their 3D projectiles and effects are drawn with their 2D stand-in, their bars at the 2D place, as without an extraction; the forms, mounts and effects are still followed from the core's ticks, so the models pick up where they are when the page leaves. The dry run sends that 2D art ahead too. A JPEG page watching the same frame as a draw-list page sees the same 2D stand-in. Without the fallback the page drew the first model image ever read back (the frame buffer read once, its pixels kept as a texture) for every model: the Mega Minion hero showed as pieces of the Hero Tombstone. Measured with the blue example deck's two hero forms (`:realistic:phoneRenderBench --args="OUT 900,1800,2700 720x1560 --sc3d=DIR"`, add `--models` for the old behaviour): 0.36 Mbit/s, 1.5 KB a frame, 2,042 patches, parity 0.32 levels mean difference (0.30-0.35% of pixels off by more than 8), as before 3D; with the models, 9,692 regions instead of 2,095 and parity 0.97-2.2 levels (1-2.3% off). A first battle on a fresh server through `badlink.py` (5 Mbit/s, 20 ms, stalls of 300-1,300 ms) showed 19.8 fps, 22.4 MB in 92 s (frames 3.1 MB, 1.6 KB each; art 19.2 MB); on a plain link 27.2 fps, frames 1.8 KB each, steady 0.55-1.0 Mbit/s.
+**3D units.** With a 3D extraction (`--sc3d`, [realistic rendering §10](realistic-rendering.md#10-3d-assets-sc3d)) the hero forms, evolutions, their 3D projectiles and effects are 3D models. On the server a model reaches the batch as an image rendered anew each frame, which a draw list could only carry as a fresh texture every frame (a few hundred KB a unit a frame). So the page renders the models itself; see [3D models on the phone](#3d-models-on-the-phone).
+
+## 3D models on the phone
+
+The server keeps all of a model's logic: the state machines (which clip plays, its time, the cross-fade from the last one), the forms and mounts, the deploy filter, the effects' timelines. The page only samples clips and draws. At the place in the draw order where the server's batch would composite a model's image (or its shadow), the draw list carries a **model draw** (`ModelInstance`, made by `ModelRecorder` from `ModelRenderer.Remote`):
+
+- each part's model ref (a model file placed by its prefab transform, with its shadow flag and the geometry left out; defined once per page, like regions), the part it rides and the node it sits at;
+- each part's clip, its time, and the clip faded from with its time and weight (the state machine's output, not bone matrices: a few bytes against 3 KB of matrices for a 50-joint hero);
+- the ground point (lifted) and the frame pixels per metre, the heading, the side (team colour), the colour multiply and add, the clipping plane, the light (or the shadow's line), the rectangle the image covers as rendered and as composited (a deploy squash), the shadow's colour;
+- the glow uniforms of glowing geometry (`FRESNEL`, `RIMLIGHT`), and the effect draws into the image (`FxRenderer`): each effect model's matrix as the server's timeline placed it, its shader (`vfx_mask`, `vfx_mask2`, `vfx_fresnel_simple`), additive or blended, billboard or not, its resolved uniforms and textures, and the effect clock.
+
+Each draw is coded as the changes from the nearest draw of the same parts in the last frame sent (a field mask; clip times as 1/4096 s deltas). A moving, animating unit costs about 16 bytes a draw before deflate, 26 with effects running (the bench over a whole hero battle); a model draw and its shadow are two draws.
+
+**Model files.** The page fetches each model once over HTTP, with the token's cookie: `/m3d/model/<id>.bin` (`ModelAssets.build`: node tree, skin, the clips with rotations as int16 and translations and scales as uint16 over their range, constant channels folded to one key and rest-valued ones left out, primitives with float positions and uv, int16 normals and tangents, uint8 joints and uint16 weights; deflated) and its textures `/m3d/tex/<id>.png` (the extraction's PNGs; opaque colour textures as JPEG at 0.92, the MRA, normal, team and reflection textures lossless), plus `/m3d/scene.json` (the light, camera and team colours). Ids are content stamps, cached as immutable, so a second battle (or a reload) fetches nothing. The server's dry run records which models the battle draws and the page preloads them (text message `{"type":"models","assets":[...]}`); the start button waits for those it has been told of. A hero battle's models are 5-9 MB: 8 models 6.4 MB for the fliers replay (Mega Minion, Balloon, Minion Giant, Skeleton Trooper and their projectiles), 10 models 5.4 MB for the two hero decks over a bot battle, 14 models (with effect meshes) 8.2 MB over HTTP for a played battle of them. ASTC (`WEBGL_compressed_texture_astc`, which iOS Safari has) would cut the GPU memory, but the art cache keeps the textures as PNG (the game's KTX2 files are not in it) and headless Chromium has no ASTC for the parity check.
+
+**On the page** (WebGL 2; the shaders are compiled when the page loads): each frame's model draws are rendered first into one 2048x2048 atlas with a depth buffer (one render-target switch a frame), each into its own region at twice the screen's pixels as the server renders at twice the frame's (shadows at half that), shrunk when the atlas would not hold them. A part is posed on the CPU (`Rig.java` ported: clip sampling, cross-fade, node tree, mounts at the host's bone), its joint matrices go to a float texture (a row a part) and the mesh is skinned in the vertex shader. Shading is `UberPbr`'s `TINT | CLIP_PLANE | NEW_UBER` port with the `FRESNEL`/`RIMLIGHT` terms in GLSL ES 3.00; shadows are the planar shadow mask and the four-tap `shadow_2d_composite`; effects are `FxShaders`' ports, billboards placed in the vertex shader, depth-tested against the lit parts without writing depth. The draw-list player then draws each region as a quad at the model's place in the draw order, premultiplied, as the server's batch draws its image. A model whose file has not arrived is skipped until it has.
+
+**Measured** (`:realistic:phoneRenderBench --args="OUT FRAMES 720x1560 --replay=FILE"` or `--decks=heroes,heroes2`, then `tools/phone-render/parity.py OUT [--browser webkit]`, which now reports the difference inside the model images too):
+
+| Battle | Stream | Model draws a frame | Parity, whole frame (mean, >8) | Parity inside the model images (mean, >8) |
+|---|---|---|---|---|
+| fliers replay (4 heroes, 190 s) | 0.35 Mbit/s, 1.4 KB a frame | 3.8 avg, 10 max | 0.27-0.37, 0.21-0.50% | 0.85-1.7, 0.8-3.1% |
+| swaps replay (Berserker, Dark Prince, Wizard forms) | 0.25 Mbit/s | 3.1 avg, 8 max | 0.31-0.34, 0.33-0.41% | 0.94-1.6, 1.2-3.3% |
+| queen replay (Hero Tombstone, Mega Minion) | 0.37 Mbit/s | 1.4 avg, 14 max | 0.32-0.36, 0.32-0.42% | 1.4-1.8, 2.0-2.5% |
+| hero decks, two bots (effects: Giant aura, Electro Giant pulse, Bowler) | 0.30 Mbit/s, 1.3 KB a frame | 2.1 avg, 8 max | 0.31-0.36, 0.29-0.39% | 0.41-0.50 with effects, 0.4-0.7% |
+
+With the page in a headless browser at an iPhone's size (`tools/phone-render/e2e.py --deck heroes --opponent-deck heroes2`, a first battle of the two hero decks on a fresh browser, a card played every 4 s):
+
+| Link | Shown, average | Longest gap: worst, median of 2 s windows | Stream | Model files |
+|---|---|---|---|---|
+| plain, Chromium (150 s) | 28.4 fps | 2,000 ms (the battle switch), 51 ms | frames 1.4 KB avg (0.6-3.6 KB a 10 s window: 0.14-0.86 Mbit/s); 25.6 MB over the WebSocket, art included | 8.2 MB, 14 models (with effect meshes), 52 textures |
+| 5 Mbit/s, 20 ms, stalls of 300-1,300 ms (`badlink.py`), Chromium | 23.4 fps | 2,916 ms, 203 ms | frames 1.1 KB avg; 18.1 MB | 5.8 MB, 10 models; 36 model draws (0.6 s of one unit) skipped while a file arrived |
+| plain, WebKit | 30 fps in battle | 85 ms, 51 ms | frames 0.9 KB avg | 4.5 MB, 8 models |
+
+Once the art and models are in, a hero battle streams 0.1-0.9 Mbit/s, well under 1.5 Mbit/s. WebKit draws a frame in 0.3-0.8 ms (its timer's resolution is 1 ms), of which the 3D models (four draws: two units and their shadows) take 0.2-0.5 ms; Chromium 0.3-0.5 ms with 0.1-0.4 ms of models; the first frame of a new model 4-12 ms (its upload). Before 3D the bad link showed 20.8 fps, worst gap 2,383 ms, median 267 ms.
+
+WebKit is within 0.05 of Chromium. The difference inside the models is the specular sparkle of sub-pixel normals and the colour textures' JPEG; a frame without models differs as before (0.27-0.31). The page renders a frame's models in 1-2 ms (headless Chromium and WebKit; the first frame of a model 4 ms). Recording a frame on the server takes 1-3.5 ms with models (their bounds need the posed vertices on the CPU), against 0.6 ms without.
 
 **Protocol.** On the same WebSocket as video, as binary messages in order (never replaced, unlike video frames):
 
 | Type (first byte) | Message |
 |---|---|
-| 2 | a draw-list frame: the video frame's 20-byte header (type, frame, tick, the last input applied, the coding time, flags: 1 key frame, capture time), then the deflated payload (`DrawCodec`'s format) |
+| 2 | a draw-list frame: the video frame's 20-byte header (type, frame, tick, the last input applied, the coding time, flags: 1 key frame, capture time), then the deflated payload (`DrawCodec`'s format; its first byte's flag 2 adds the model section: new model refs, then the model draws) |
 | 3 | a texture patch: type, flags (1: plain, else art: premultiply and mipmap), page, the page's width and height, the patch's x and y in it (24 bytes), then the PNG |
 
-and a text message `{"type":"reset"}` when the page is to drop its pages and definitions (a fresh texture store). The page asks for its picture with `{"type":"picture","mode":"list"|"jpeg",...}`; a page that reconnects is sent a key frame and the patches its frames need again.
+and a text message `{"type":"reset"}` when the page is to drop its pages and definitions (a fresh texture store), and `{"type":"models","assets":[...]}` naming model files to preload. The page asks for its picture with `{"type":"picture","mode":"list"|"jpeg","models":true|false,...}` (models false: the 2D stand-in; the server records 3D only while every draw-list page of the seat asks for it); a page that reconnects is sent a key frame and the patches its frames need again.
 
 **Measured** with the page in headless Chromium at an iPhone's size (`tools/phone-render/e2e.py`), a first battle on a fresh server, cards played every 4 s:
 
@@ -174,6 +211,6 @@ For a tunnel or a phone network, start the server with `--size 540x1170` and pic
 - No emotes, no king tower activation animation before the first hit, no intro banners: the battle starts one second after both players tap.
 - No placement ghost of the unit's own sprite: rings mark where the units land.
 - The bot is a handful of rules; there is no difficulty setting.
-- Drawn on the phone, 3D units show their 2D stand-in (see *3D units* above); only video shows the models.
+- Drawn on the phone, the 3D models need WebGL 2 (a WebGL 1 page gets the 2D stand-in). Not drawn on the phone: bloom (not drawn by the server either) and the effects' particle emitters (not drawn by the server either). A model's first appearance before its file has arrived shows nothing for that moment (the dry run's preload makes this rare). A first battle with new hero decks downloads 5-9 MB of model files over HTTP beside the stream, on a slow link competing with the art. The server renders an effect texture wrong the first time it rasterizes it (a JPEG page's first frame of that effect); the page has no such glitch.
 - One battle at a time per server; extra pages watch side 0 (or side 1 in a friend battle) and can play for it.
 - The art is Supercell's: the stream is for you and your friends, under its Fan Content Policy. Never leave a public tunnel open.

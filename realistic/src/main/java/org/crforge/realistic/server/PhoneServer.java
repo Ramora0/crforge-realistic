@@ -121,6 +121,15 @@ public final class PhoneServer extends ApplicationAdapter implements WebServer.H
   private DrawDefs defs;
   private int generation;
 
+  /**
+   * The 3D models pages render themselves (docs/phone-server.md, "3D models on the phone"), for the
+   * server's life; null without a 3D extraction or with {@code --models 2d}.
+   */
+  private ModelAssets modelAssets;
+
+  /** The scene uniforms of the models, as {@code /m3d/scene.json}. */
+  private volatile byte[] sceneJson;
+
   /** One page connected. */
   static final class Client {
     final WebServer.Socket socket;
@@ -144,6 +153,12 @@ public final class PhoneServer extends ApplicationAdapter implements WebServer.H
 
     /** How far through the battle's prefetch list the page has been taken. */
     int prefetched;
+
+    /** Whether the page renders the 3D models (else it asks for their 2D stand-in). */
+    volatile boolean models3d = true;
+
+    /** How many of the battle's models to preload the page has been told of. */
+    int modelsTold;
 
     /** The bytes of prefetch the page may be sent now ({@link #PREFETCH_RATE}), and since when. */
     double prefetchAllowance;
@@ -200,6 +215,13 @@ public final class PhoneServer extends ApplicationAdapter implements WebServer.H
     /** Texture patches the battle will likely draw, in the order the dry run drew them. */
     final List<Integer> prefetch = java.util.Collections.synchronizedList(new ArrayList<>());
 
+    /**
+     * The 3D models (asset ids) the battle will likely draw, in the order the dry run drew them.
+     */
+    final List<String> models = new ArrayList<>();
+
+    final java.util.Set<Integer> modelRefsSeen = new java.util.HashSet<>();
+
     final String[] stateSent = new String[2];
 
     Match(Setup setup) {
@@ -226,6 +248,7 @@ public final class PhoneServer extends ApplicationAdapter implements WebServer.H
                 names,
                 new DrawRecorder(defs));
         encoding[side] = new Encoding(side);
+        seats[side].recordModels(assets(seats[side]));
       }
       schedule = BattleSchedule.read(cache.folder(), seats[0].locationName());
       rehearsal = new Rehearsal(this, mine, theirs, location, names);
@@ -286,8 +309,20 @@ public final class PhoneServer extends ApplicationAdapter implements WebServer.H
               options.height(),
               names,
               new DrawRecorder(defs));
-      // the rehearsal fetches what draw lists use: the 3D rows' 2D stand-in
-      seat.drawModels(false);
+      // the rehearsal fetches what draw lists use: the 3D models (their files, preloaded by the
+      // pages), else the 3D rows' 2D stand-in
+      ModelRecorder rec = seat.recordModels(assets(seat));
+      if (rec != null) {
+        rec.refUsed =
+            ref -> {
+              if (match.modelRefsSeen.add(ref)) {
+                String asset = modelAssets.ref(ref).asset();
+                if (!match.models.contains(asset)) match.models.add(asset);
+              }
+            };
+      } else {
+        seat.drawModels(false);
+      }
       seat.tick(BattleAdapter.frame(session), false, new ArrayList<>());
     }
 
@@ -321,7 +356,11 @@ public final class PhoneServer extends ApplicationAdapter implements WebServer.H
 
     private void finish() {
       done = true;
-      log.info("Dry run: {} ticks, {} texture patches to send ahead", ticks, match.prefetch.size());
+      log.info(
+          "Dry run: {} ticks, {} texture patches to send ahead, {} 3D models to preload",
+          ticks,
+          match.prefetch.size(),
+          match.models.size());
       dispose();
     }
 
@@ -521,12 +560,44 @@ public final class PhoneServer extends ApplicationAdapter implements WebServer.H
       }
       return WebServer.Response.text(404, "no such sample");
     }
+    if (path.startsWith("/m3d/")) return modelRoute(path);
     if (path.equals("/favicon.ico") || path.startsWith("/apple-touch-icon")) {
       // no icon: the game's art is not for a home screen icon
       return WebServer.Response.of(204, null, new byte[0]);
     }
     log.info("404 {}", path);
     return WebServer.Response.text(404, "not found");
+  }
+
+  /**
+   * The 3D models' files: {@code /m3d/scene.json} (the light, camera and team colours), {@code
+   * /m3d/model/<id>.bin} (a model, {@link ModelAssets#build}) and {@code /m3d/tex/<id>.png} (a
+   * texture). Ids are content stamps, so the files are cached as immutable.
+   */
+  private WebServer.Response modelRoute(String path) {
+    ModelAssets a = modelAssets;
+    if (path.equals("/m3d/scene.json")) {
+      byte[] scene = sceneJson;
+      if (scene == null) return WebServer.Response.text(404, "no 3D models");
+      return new WebServer.Response(
+          200, "application/json", scene, Map.of("Cache-Control", "no-cache"));
+    }
+    if (a == null) return WebServer.Response.text(404, "no 3D models");
+    String id = path.substring(path.lastIndexOf('/') + 1);
+    int dot = id.indexOf('.');
+    if (dot > 0) id = id.substring(0, dot);
+    Optional<byte[]> bytes = Optional.empty();
+    String type = "application/octet-stream";
+    if (path.startsWith("/m3d/model/")) {
+      bytes = a.model(id);
+    } else if (path.startsWith("/m3d/tex/")) {
+      bytes = a.texture(id);
+      boolean jpeg = bytes.isPresent() && bytes.get().length > 2 && (bytes.get()[0] & 0xFF) == 0xFF;
+      type = jpeg ? "image/jpeg" : "image/png";
+    }
+    if (bytes.isEmpty()) return WebServer.Response.text(404, "no such model file");
+    return new WebServer.Response(
+        200, type, bytes.get(), Map.of("Cache-Control", "private, max-age=31536000, immutable"));
   }
 
   @Override
@@ -590,6 +661,44 @@ public final class PhoneServer extends ApplicationAdapter implements WebServer.H
         match.location());
   }
 
+  /**
+   * The server's 3D model assets, made with the first seat that has a 3D extraction; null without
+   * one or with {@code --models 2d}.
+   */
+  private ModelAssets assets(Seat seat) {
+    if (!options.models3d()) return null;
+    if (modelAssets == null) {
+      var library = seat.modelLibrary();
+      if (library == null) return null;
+      modelAssets = new ModelAssets(library);
+      float[][] u = org.crforge.realistic.render.art.model.ModelRenderer.sceneUniforms(library);
+      ObjectNode scene = JSON.createObjectNode();
+      String[] names = {"light", "camera", "direct", "ambient", "blue", "red"};
+      for (int i = 0; i < names.length; i++) {
+        ArrayNode a = scene.putArray(names[i]);
+        for (float f : u[i]) a.add(f);
+      }
+      scene.put("tilt", org.crforge.realistic.render.art.model.ModelCamera.TILT_DEGREES);
+      sceneJson = scene.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      log.info("3D models: drawn by the pages (from {})", library.folder());
+    }
+    return modelAssets;
+  }
+
+  /** Tells the pages of the battle's models to preload that they have not been told of. */
+  private void tellModels() {
+    if (match == null) return;
+    List<String> list = match.models;
+    for (Client c : clients) {
+      if (c.side < 0 || c.modelsTold >= list.size() || !listMode(c) || !c.models3d) continue;
+      ObjectNode m = JSON.createObjectNode().put("type", "models");
+      ArrayNode a = m.putArray("assets");
+      for (int i = c.modelsTold; i < list.size(); i++) a.add(list.get(i));
+      c.modelsTold = list.size();
+      c.send(m);
+    }
+  }
+
   /** A fresh texture store: pages fill up as battles draw new art. */
   private void newStore() {
     if (store != null) store.dispose();
@@ -607,6 +716,7 @@ public final class PhoneServer extends ApplicationAdapter implements WebServer.H
     ArrayNode clear = hello.putArray("clear");
     for (float f : Seat.CLEAR) clear.add(f);
     hello.put("audio", audio != null);
+    hello.put("models3d", options.models3d());
     hello.set("options", matchOptions.json(JSON));
     c.send(hello);
   }
@@ -712,6 +822,7 @@ public final class PhoneServer extends ApplicationAdapter implements WebServer.H
     for (Client c : clients) {
       c.keyNext = true;
       c.prefetched = 0;
+      c.modelsTold = 0;
     }
     log.info("New battle: {} on {}", setup.friend() ? "friend" : "bot", match.location());
     // seats anew: against the bot everyone sees side 0; with a friend the pages share it out
@@ -748,6 +859,7 @@ public final class PhoneServer extends ApplicationAdapter implements WebServer.H
       if (!mode.equals(c.mode)) c.keyNext = true;
       c.mode = mode;
     }
+    if (msg.has("models")) c.models3d = msg.path("models").asBoolean(true);
     if (c.side < 0 || match.encoding[c.side] == null) return;
     Encoding enc = match.encoding[c.side];
     enc.maxQuality =
@@ -797,6 +909,7 @@ public final class PhoneServer extends ApplicationAdapter implements WebServer.H
       match.rehearsal.run(match.phase == Phase.WAITING ? 12_000_000L : 3_000_000L);
       if (match.rehearsal.done) match.rehearsal = null;
     }
+    tellModels();
     long now = System.nanoTime();
     advance(now);
     for (int side = 0; side < 2; side++) {
@@ -1034,8 +1147,13 @@ public final class PhoneServer extends ApplicationAdapter implements WebServer.H
     long t0 = System.nanoTime();
     if (rasterize) fbo.begin();
     if (frame != null) recorder.startFrame(frame, options.width(), options.height(), rasterize);
-    // a draw list carries the 3D rows' 2D stand-in (a JPEG viewer sharing the frame sees it too)
-    seat.drawModels(frame == null);
+    // a draw list carries the 3D models for its pages to render (a JPEG viewer sharing the frame
+    // sees them drawn here); with a page that asks for the 2D stand-in, or no 3D models, the 3D
+    // rows' 2D stand-in (which a JPEG viewer then sees too)
+    boolean models3d = seat.modelRecorder() != null;
+    for (Client c : list) models3d &= c.models3d;
+    if (seat.modelRecorder() != null) seat.modelRecorder().setOn(models3d);
+    seat.drawModels(frame == null || models3d);
     List<String[]> heard = new ArrayList<>();
     seat.draw(alpha, camera, shapes, heard);
     if (frame != null) recorder.endFrame();
@@ -1068,7 +1186,7 @@ public final class PhoneServer extends ApplicationAdapter implements WebServer.H
       if (c.generation != frameGeneration) {
         // a fresh store (or a new page): the page drops its pages and definitions
         if (c.encoder != null) c.encoder.dispose();
-        c.encoder = new DrawCodec.Encoder(frameDefs, 6);
+        c.encoder = new DrawCodec.Encoder(frameDefs, 6).models(modelAssets);
         c.patchesHave = new java.util.BitSet();
         c.prefetched = 0;
         c.generation = frameGeneration;
@@ -1286,6 +1404,7 @@ public final class PhoneServer extends ApplicationAdapter implements WebServer.H
     if (fbo != null) fbo.dispose();
     if (shapes != null) shapes.dispose();
     if (store != null) store.dispose();
+    if (modelAssets != null) modelAssets.dispose();
     for (Client c : clients) if (c.encoder != null) c.encoder.dispose();
     cache.dispose();
   }

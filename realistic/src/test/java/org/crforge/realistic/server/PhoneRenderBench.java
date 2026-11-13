@@ -34,6 +34,8 @@ import org.crforge.realistic.bridge.BattleAdapter;
 import org.crforge.realistic.bridge.BattleDecks;
 import org.crforge.realistic.bridge.BattleFrame;
 import org.crforge.realistic.bridge.BattleSession;
+import org.crforge.realistic.bridge.ReplayFile;
+import org.crforge.realistic.bridge.ReplayPlayer;
 import org.crforge.realistic.render.art.ArtCache;
 
 /**
@@ -43,10 +45,13 @@ import org.crforge.realistic.render.art.ArtCache;
  * as a key frame, for the page to replay ({@code tools/phone-render/parity.py}).
  *
  * <p>{@code ./gradlew :realistic:phoneRenderBench -Pcrforge.assetSource=cdn --args="OUT_DIR [frames
- * 900,1800] [WxH] [--sc3d=DIR] [--models]"}. Needs the art cache and a display (a hidden window).
- * With {@code --sc3d} the blue deck's hero forms (the Mega Minion, the Hero Tombstone) have 3D
- * models; the stream draws their 2D stand-in as the server does, or with {@code --models} their
- * model images (what the stream would carry without that fallback).
+ * 900,1800] [WxH] [--sc3d=DIR] [--models|--2d] [--replay=FILE]"}. Needs the art cache and a display
+ * (a hidden window). With a 3D extraction the 3D rows (the blue deck's hero forms, the Mega Minion
+ * and the Hero Tombstone; a replay's heroes) are sent as model draws the page renders itself, as
+ * the server does ({@link ModelRecorder}); the parity frames then also write the model files they
+ * use ({@code m3d/}). With {@code --2d} the stream draws their 2D stand-in instead, with {@code
+ * --models} their model images (what the stream would carry with neither). With {@code --replay}
+ * the battle is that replay's rather than two bots'.
  */
 public final class PhoneRenderBench extends ApplicationAdapter {
 
@@ -57,22 +62,39 @@ public final class PhoneRenderBench extends ApplicationAdapter {
   private final int width;
   private final int height;
   private final boolean models;
+  private final boolean flat;
+  private final Path replay;
+  private ModelAssets assets;
 
-  PhoneRenderBench(Path out, Set<Integer> dumps, int width, int height, boolean models) {
+  PhoneRenderBench(
+      Path out,
+      Set<Integer> dumps,
+      int width,
+      int height,
+      boolean models,
+      boolean flat,
+      Path replay) {
     this.out = out;
     this.dumps = dumps;
     this.width = width;
     this.height = height;
     this.models = models;
+    this.flat = flat;
+    this.replay = replay;
   }
 
   public static void main(String[] args) throws IOException {
     System.setProperty("java.awt.headless", "true");
     boolean models = false;
+    boolean flat = false;
+    Path replay = null;
     List<String> positional = new ArrayList<>();
     for (String a : args) {
       if (a.startsWith("--sc3d=")) System.setProperty("crforge.sc3d", a.substring(7));
       else if (a.equals("--models")) models = true;
+      else if (a.equals("--2d")) flat = true;
+      else if (a.startsWith("--replay=")) replay = Paths.get(a.substring(9));
+      else if (a.startsWith("--decks=")) System.setProperty("crforge.benchDecks", a.substring(8));
       else positional.add(a);
     }
     args = positional.toArray(new String[0]);
@@ -93,7 +115,7 @@ public final class PhoneRenderBench extends ApplicationAdapter {
     config.setWindowPosition(0, 0);
     config.setInitialVisible(false);
     config.useVsync(false);
-    new Lwjgl3Application(new PhoneRenderBench(out, dumps, w, h, models), config);
+    new Lwjgl3Application(new PhoneRenderBench(out, dumps, w, h, models, flat, replay), config);
   }
 
   @Override
@@ -113,20 +135,45 @@ public final class PhoneRenderBench extends ApplicationAdapter {
     TextureStore textures = new TextureStore(cache);
     DrawDefs defs = new DrawDefs(textures);
     DrawRecorder recorder = new DrawRecorder(defs);
-    BattleSession session =
-        BattleSession.ladder(
-            tables,
-            BattleDecks.BLUE,
-            BattleDecks.blueSlots(),
-            BattleDecks.RED,
-            BattleDecks.redSlots());
+    ReplayPlayer player = null;
+    BattleSession session;
+    if (replay != null) {
+      ReplayFile file = ReplayFile.read(replay, tables);
+      player = new ReplayPlayer(file, tables);
+      session = player.getSession();
+      if (session == null) {
+        throw new IllegalStateException(
+            "the replay cannot be played: " + String.join("; ", file.describe()));
+      }
+    } else if (System.getProperty("crforge.benchDecks") != null) {
+      // two of the server's decks (MatchOptions), e.g. the hero decks
+      String[] ids = System.getProperty("crforge.benchDecks").split(",");
+      MatchOptions options = new MatchOptions(tables, cache.folder());
+      MatchOptions.Deck a = options.deck(ids[0], "blue");
+      MatchOptions.Deck b = options.deck(ids.length > 1 ? ids[1] : ids[0], "red");
+      session = BattleSession.ladder(tables, a.cards(), a.slots(), b.cards(), b.slots());
+    } else {
+      session =
+          BattleSession.ladder(
+              tables,
+              BattleDecks.BLUE,
+              BattleDecks.blueSlots(),
+              BattleDecks.RED,
+              BattleDecks.redSlots());
+    }
     Seat seat =
         new Seat(0, cache, tables, session, null, width, height, List.of("You", "Bot"), recorder);
     Bot blue = new Bot(0, 11);
     Bot red = new Bot(1, 22);
     List<String[]> heard = new ArrayList<>();
-    // as the server records a draw list: the 3D rows' 2D stand-in (or, to measure, their models)
-    seat.drawModels(models);
+    // as the server records a draw list: the 3D models as model draws (or the 3D rows' 2D
+    // stand-in, or, to measure, their model images)
+    boolean phone3d = !models && !flat && seat.modelLibrary() != null;
+    if (phone3d) {
+      assets = new ModelAssets(seat.modelLibrary());
+      seat.recordModels(assets);
+    }
+    seat.drawModels(models || phone3d);
     seat.tick(BattleAdapter.frame(session), false, heard);
 
     FrameBuffer fbo = new FrameBuffer(Pixmap.Format.RGBA8888, width, height, false);
@@ -134,7 +181,7 @@ public final class PhoneRenderBench extends ApplicationAdapter {
     camera.setToOrtho(false, width, height);
     ShapeRenderer shapes = new ShapeRenderer();
     ByteBuffer pixels = BufferUtils.newByteBuffer(width * height * 4);
-    DrawCodec.Encoder encoder = new DrawCodec.Encoder(defs, 6);
+    DrawCodec.Encoder encoder = new DrawCodec.Encoder(defs, 6).models(assets);
     DrawFrame[] ring = {new DrawFrame(), new DrawFrame()};
     int patchesSent = 0;
     long patchBytes = 0;
@@ -150,9 +197,12 @@ public final class PhoneRenderBench extends ApplicationAdapter {
     int frames = 0;
     int maxPolys = 0, maxVerts = 0;
     long polys = 0, verts = 0, flushes = 0;
+    long modelDraws = 0, modelBytes = 0;
+    int maxModelDraws = 0;
     try (PrintWriter csv = new PrintWriter(Files.newBufferedWriter(out.resolve("frames.csv")))) {
       csv.println(
-          "frame,tick,polygons,seen,vertices,flushes,raw,bytes,record_ms,encode_ms,patch_bytes");
+          "frame,tick,polygons,seen,vertices,flushes,raw,bytes,record_ms,encode_ms,patch_bytes,"
+              + "model_draws,model_raw,effect_draws");
       for (int k = 0; ; k++) {
         double t = k * 1000.0 / FPS;
         // the ticks due by this frame's time, as the server steps them (20 a second)
@@ -160,9 +210,11 @@ public final class PhoneRenderBench extends ApplicationAdapter {
           ticks++;
           if (outro == 0) {
             BattleFrame before = seat.current;
-            blue.decide(session, before);
-            red.decide(session, before);
-            if (session.step()) {
+            if (player == null) {
+              blue.decide(session, before);
+              red.decide(session, before);
+            }
+            if (player != null ? player.step() : session.step()) {
               seat.tick(BattleAdapter.frame(session), false, heard);
             } else {
               outro = 1;
@@ -209,6 +261,9 @@ public final class PhoneRenderBench extends ApplicationAdapter {
         }
         bytes += packed.length;
         rawBytes += encoder.rawBytes;
+        modelDraws += frame.models.size();
+        maxModelDraws = Math.max(maxModelDraws, frame.models.size());
+        modelBytes += encoder.modelBytes;
         maxBytes = Math.max(maxBytes, packed.length);
         int v = frame.vertexCount();
         polys += frame.count;
@@ -219,7 +274,7 @@ public final class PhoneRenderBench extends ApplicationAdapter {
         frames++;
         csv.printf(
             Locale.ROOT,
-            "%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d%n",
+            "%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%d,%d,%d,%d%n",
             k,
             ticks,
             frame.count,
@@ -230,7 +285,10 @@ public final class PhoneRenderBench extends ApplicationAdapter {
             packed.length,
             rm,
             em,
-            frameTex);
+            frameTex,
+            frame.models.size(),
+            encoder.modelBytes,
+            frame.models.stream().mapToInt(m -> m.fx.size()).sum());
       }
     }
     long texBytes = patchBytes;
@@ -244,7 +302,9 @@ public final class PhoneRenderBench extends ApplicationAdapter {
                 + "stream: %.2f Mbit/s at %d fps%n"
                 + "record %.2f ms avg (%.1f max), encode %.2f ms avg (%.1f max)%n"
                 + "regions %d, states %d; patches %d, %.1f MB as PNG, max %.0f KB in a frame;"
-                + " pages %d (%.1f M texels); 3D models %s%n",
+                + " pages %d (%.1f M texels); 3D models %s%n"
+                + "model draws a frame: avg %.1f max %d; model section %.1f bytes a draw before"
+                + " deflate; model files %.2f MB (%d models)%n",
             frames,
             frames / (double) FPS,
             FPS,
@@ -270,7 +330,12 @@ public final class PhoneRenderBench extends ApplicationAdapter {
             maxPatchFrame / 1024.0,
             textures.pageCount() - 1,
             textures.texels() / 1e6,
-            models ? "drawn as images" : "off (2D stand-in)");
+            models ? "drawn as images" : phone3d ? "sent as model draws" : "off (2D stand-in)",
+            modelDraws / (double) frames,
+            maxModelDraws,
+            modelDraws == 0 ? 0 : modelBytes / (double) modelDraws,
+            assets == null ? 0 : assets.bytes(assetIds()) / 1e6,
+            assets == null ? 0 : assetIds().size());
     System.out.print(summary);
     Files.writeString(out.resolve("summary.txt"), summary);
     encoder.dispose();
@@ -279,6 +344,13 @@ public final class PhoneRenderBench extends ApplicationAdapter {
     seat.dispose();
     textures.dispose();
     cache.dispose();
+  }
+
+  /** The model files the battle's draws used. */
+  private java.util.Set<String> assetIds() {
+    java.util.Set<String> ids = new TreeSet<>();
+    for (int i = 0; i < assets.refCount(); i++) ids.add(assets.ref(i).asset());
+    return ids;
   }
 
   /**
@@ -298,9 +370,49 @@ public final class PhoneRenderBench extends ApplicationAdapter {
     // opaque, as the canvas is
     for (int i = 3; i < flipped.length; i += 4) flipped[i] = (byte) 255;
     Files.write(out.resolve(k + "_server.png"), TextureStore.encodePng(width, height, flipped));
-    DrawCodec.Encoder fresh = new DrawCodec.Encoder(defs, 6);
+    DrawCodec.Encoder fresh = new DrawCodec.Encoder(defs, 6).models(assets);
     Files.write(out.resolve(k + ".bin"), fresh.encode(frame, true));
     fresh.dispose();
+    if (assets != null && !frame.models.isEmpty()) {
+      // the model files the frame's draws use, as the server serves them (/m3d/...)
+      Path m3d = out.resolve("m3d");
+      Files.createDirectories(m3d.resolve("model"));
+      Files.createDirectories(m3d.resolve("tex"));
+      float[][] u =
+          org.crforge.realistic.render.art.model.ModelRenderer.sceneUniforms(assets.library());
+      StringBuilder scene = new StringBuilder("{");
+      String[] names = {"light", "camera", "direct", "ambient", "blue", "red"};
+      for (int i = 0; i < names.length; i++) {
+        if (i > 0) scene.append(',');
+        scene.append('"').append(names[i]).append("\":[");
+        for (int j = 0; j < u[i].length; j++) {
+          if (j > 0) scene.append(',');
+          scene.append(u[i][j]);
+        }
+        scene.append(']');
+      }
+      Files.writeString(m3d.resolve("scene.json"), scene.append('}'));
+      for (ModelInstance mi : frame.models) {
+        List<Integer> used = new ArrayList<>();
+        for (int ref : mi.refs) used.add(ref);
+        for (ModelInstance.Fx e : mi.fx) {
+          used.add(e.ref());
+          for (String t : e.textures()) {
+            if (t != null) {
+              Files.write(m3d.resolve("tex").resolve(t + ".png"), assets.texture(t).orElseThrow());
+            }
+          }
+        }
+        for (int ref : used) {
+          String id = assets.ref(ref).asset();
+          byte[] bin = assets.model(id).orElseThrow();
+          Files.write(m3d.resolve("model").resolve(id + ".bin"), bin);
+          for (String t : ModelAssets.textureIds(bin)) {
+            Files.write(m3d.resolve("tex").resolve(t + ".png"), assets.texture(t).orElseThrow());
+          }
+        }
+      }
+    }
     StringBuilder json = new StringBuilder("[");
     Path dir = out.resolve(k + "_patches");
     Files.createDirectories(dir);

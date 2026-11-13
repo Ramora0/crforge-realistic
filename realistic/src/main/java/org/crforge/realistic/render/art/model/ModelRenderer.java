@@ -90,7 +90,94 @@ public final class ModelRenderer implements Disposable {
 
     /** Draws into the bound image (depth test on), {@code mvp} from prefab to clip space. */
     void draw(Instance in, Matrix4 mvp);
+
+    /** The effect draws {@link #draw} makes, resolved for a remote renderer, in draw order. */
+    default List<RemoteEffect> remoteEffects() {
+      return List.of();
+    }
+
+    /** The effect clock the effect draws scroll their textures by (seconds). */
+    default float effectTime() {
+      return 0f;
+    }
   }
+
+  /**
+   * An effect draw resolved for a remote renderer ({@link FxRenderer}): the effect model, its
+   * matrix in the image's prefab space, the shader ({@link #MASK}, {@link #MASK2} or {@link
+   * #FRESNEL}), whether it is additive and a billboard, its uniforms ({@link FxRenderer#uniforms})
+   * and its textures (mainTex, maskTex, maskTex2, distortionTex, dissolveTex; null for white).
+   */
+  public record RemoteEffect(
+      Path glb,
+      float[] matrix,
+      int shader,
+      boolean additive,
+      boolean billboard,
+      float[] uniforms,
+      Path[] textures) {
+    public static final int MASK = 0;
+    public static final int MASK2 = 1;
+    public static final int FRESNEL = 2;
+  }
+
+  /**
+   * Where models go when they are drawn elsewhere: the phone server's draw lists send each model
+   * draw as an instance record (the parts, their clip samples, the placement and material) for the
+   * page to render itself, in place of the image (docs/phone-server.md, "3D models on the phone").
+   */
+  public interface Remote {
+    /**
+     * A model's image or shadow at its place in the draw order, its bounds already worked out.
+     * Returns whether it is also drawn here (into the image and through the compositor).
+     */
+    boolean draw(RemoteDraw draw);
+
+    /** Brackets the composite of an image also drawn here ({@code true} before, then false). */
+    void compositing(boolean on);
+  }
+
+  /**
+   * One part of a remote draw: its model ref, the geometry left out ({@link
+   * Sc3dLibrary#effectGeometry}), its clip sample, the earlier part it rides and that part's node
+   * (-1 for none), and its primitives' glow uniforms ({@link UberPbr#setGlow}; null, or null
+   * entries, for none).
+   */
+  public record RemotePart(
+      Sc3dLibrary.ModelRef ref,
+      Set<String> effects,
+      AnimPlayer.Sample sample,
+      int host,
+      int hostNode,
+      float[][] glows) {}
+
+  /**
+   * A model draw as the remote renders it: the image ({@code shadow} false: the lit model) or the
+   * planar shadow mask; its parts; its ground point {@code (x, y + lift)} and {@code unitsPerMetre}
+   * in the batch's world; the turn about z; the side; the object colour transform; the clipping
+   * plane; the light ({@code light}: towards the light for the image, the shadow's line for the
+   * shadow); {@code bounds} the world rectangle {x0, y0, x1, y1} the image covers as rendered and
+   * {@code drawn} as composited (a deploy filter's squash); {@code tint} the shadow's premultiplied
+   * colour (r, g, b, a), or null.
+   */
+  public record RemoteDraw(
+      boolean shadow,
+      List<RemotePart> parts,
+      float x,
+      float y,
+      float lift,
+      float unitsPerMetre,
+      float heading,
+      boolean blue,
+      float[] colorMul,
+      float[] colorAdd,
+      boolean clipPlane,
+      float[] light,
+      float[] bounds,
+      float[] drawn,
+      float[] tint,
+      List<RemoteEffect> effects,
+      float effectTime) {}
 
   /**
    * One model of a prefab posed: its clip sample; a mounted one ({@link Sc3dLibrary.Mount}) also
@@ -188,6 +275,69 @@ public final class ModelRenderer implements Disposable {
 
   public ModelRenderer(Sc3dLibrary library) {
     this.library = library;
+  }
+
+  private Remote remote;
+
+  /** Sends the model draws to {@code remote} (null: none), drawing them here only as it says. */
+  public void setRemote(Remote remote) {
+    this.remote = remote;
+  }
+
+  /** The draw as {@link Remote} takes it. */
+  private RemoteDraw remoteDraw(
+      Instance in,
+      boolean shadow,
+      float lift,
+      float[] light,
+      float[] b,
+      float[] drawn,
+      float[] tint) {
+    List<RemotePart> parts = new ArrayList<>();
+    for (int pi = 0; pi < in.parts.size(); pi++) {
+      Part part = in.parts.get(pi);
+      Glb glb = gpu(part.ref().glb()).rig.glb();
+      int hostNode = -1;
+      if (part.host() >= 0 && part.host() < pi) {
+        hostNode = nodeNamed(gpu(in.parts.get(part.host()).ref().glb()).rig.glb(), part.bone());
+      }
+      float[][] glows = null;
+      if (!shadow && in.extras != null) {
+        for (int i = 0; i < glb.primitives().size(); i++) {
+          int node = glb.primitiveNode(i);
+          float[] g = node < 0 ? null : in.extras.shading(pi, glb.nodes().get(node).name());
+          if (g == null) continue;
+          if (glows == null) glows = new float[glb.primitives().size()][];
+          glows[i] = g;
+        }
+      }
+      parts.add(
+          new RemotePart(
+              part.ref(),
+              library.effectGeometry(part.ref()),
+              part.sample(),
+              part.host() < pi ? part.host() : -1,
+              hostNode,
+              glows));
+    }
+    return new RemoteDraw(
+        shadow,
+        parts,
+        in.x,
+        in.y,
+        lift,
+        in.unitsPerMetre,
+        in.heading,
+        in.blue,
+        in.colorMul,
+        in.colorAdd,
+        in.prefab.clipPlane(),
+        light,
+        b.clone(),
+        drawn,
+        tint,
+        shadow || in.extras == null ? List.of() : in.extras.remoteEffects(),
+        in.extras == null ? 0f : in.extras.effectTime());
   }
 
   public Sc3dLibrary library() {
@@ -478,6 +628,19 @@ public final class ModelRenderer implements Disposable {
     // the image's world size is its pixel size over the scale (whole pixels)
     b[2] = b[0] + w / ppu;
     b[3] = b[1] + h / ppu;
+    if (remote != null) {
+      float[] drawn = b.clone();
+      if (in.imageScale != null) {
+        float gx = in.x;
+        float gy = in.y + in.lift;
+        drawn[0] = gx + (b[0] - gx) * in.imageScale[0];
+        drawn[2] = gx + (b[2] - gx) * in.imageScale[0];
+        drawn[1] = gy + (b[1] - gy) * in.imageScale[1];
+        drawn[3] = gy + (b[3] - gy) * in.imageScale[1];
+      }
+      float[] l = towardsLight(library.environment().light());
+      if (!remote.draw(remoteDraw(in, false, in.lift, l, b, drawn, null))) return;
+    }
     out.pause();
     int[] saved = binding();
     image = target(image, w, h, true);
@@ -547,6 +710,7 @@ public final class ModelRenderer implements Disposable {
       b[1] = gy + (b[1] - gy) * in.imageScale[1];
       b[3] = gy + (b[3] - gy) * in.imageScale[1];
     }
+    if (remote != null) remote.compositing(true);
     out.image(
         tex,
         b[0],
@@ -561,6 +725,7 @@ public final class ModelRenderer implements Disposable {
         null,
         0,
         0);
+    if (remote != null) remote.compositing(false);
   }
 
   /**
@@ -596,6 +761,11 @@ public final class ModelRenderer implements Disposable {
     int h = Math.min(MAX_SIZE, (int) Math.ceil((b[3] - b[1]) * ppu));
     b[2] = b[0] + w / ppu;
     b[3] = b[1] + h / ppu;
+    if (remote != null) {
+      float sa = color.a * in.colorMul[3];
+      float[] tint = {color.r * sa, color.g * sa, color.b * sa, sa};
+      if (!remote.draw(remoteDraw(in, true, lift, l, b, b.clone(), tint))) return;
+    }
     out.pause();
     int[] saved = binding();
     shadowImage = target(shadowImage, w, h, false);
@@ -627,6 +797,7 @@ public final class ModelRenderer implements Disposable {
     tex.setFilter(Texture.TextureFilter.Linear, Texture.TextureFilter.Linear);
     float a = color.a * in.colorMul[3];
     Color tint = new Color(color.r * a, color.g * a, color.b * a, a);
+    if (remote != null) remote.compositing(true);
     out.image(
         tex,
         b[0],
@@ -641,6 +812,7 @@ public final class ModelRenderer implements Disposable {
         composite,
         0.5f / tex.getWidth(),
         0.5f / tex.getHeight());
+    if (remote != null) remote.compositing(false);
   }
 
   /**
@@ -658,6 +830,24 @@ public final class ModelRenderer implements Disposable {
     p.setUniformf("u_dirLightColor", dir[0], dir[1], dir[2], 1f);
     float[] amb = ambientColor(light);
     p.setUniformf("u_sceneAmbientColor", amb[0], amb[1], amb[2], amb[3]);
+  }
+
+  /**
+   * The scene uniforms a remote renderer shades with, as {@link #draw} sets them: towards the
+   * environment's light, the camera position, the direct light colour, the ambient colour and
+   * reflection strength, and the blue and red team colours.
+   */
+  public static float[][] sceneUniforms(Sc3dLibrary library) {
+    Sc3dLibrary.Light light = library.environment().light();
+    Sc3dLibrary.Environment env = library.environment();
+    return new float[][] {
+      towardsLight(light),
+      ModelCamera.cameraPosition(),
+      directColor(light),
+      ambientColor(light),
+      rgb(env.blueTeam()),
+      rgb(env.redTeam())
+    };
   }
 
   /** Towards the prefab's light, or straight down from the camera's side without one. */

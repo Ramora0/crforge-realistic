@@ -91,6 +91,28 @@ public final class MatchOptions {
               "Log",
               "Skeletons",
               "Fireball"),
+          heroes(
+              "heroes",
+              "Heroes: Knight, Bowler, evolved Giant (3D)",
+              "Knight",
+              "Bowler",
+              "Giant",
+              "Musketeer",
+              "Valkyrie",
+              "Skeletons",
+              "Arrows",
+              "Zap"),
+          heroes(
+              "heroes2",
+              "Heroes: Dark Prince, Balloon, evolved Electro Giant (3D)",
+              "DarkPrince",
+              "Balloon",
+              "ElectroGiant",
+              "Wizard",
+              "MiniPekka",
+              "Archer",
+              "Fireball",
+              "Log"),
           plain(
               "xbow",
               "X-Bow",
@@ -102,6 +124,18 @@ public final class MatchOptions {
               "Skeletons",
               "Fireball",
               "Log"));
+
+  /**
+   * A deck of hero forms: the first two cards in the king's two hero slots, the third in the
+   * evolution slot (3D models on the phone, docs/phone-server.md).
+   */
+  private static Deck heroes(String id, String name, String... cards) {
+    int[] slots = new int[cards.length];
+    slots[0] = org.crforge.core.battle.match.MatchSide.HERO_SLOT;
+    slots[1] = org.crforge.core.battle.match.MatchSide.HERO_SLOT;
+    slots[2] = org.crforge.core.battle.match.MatchSide.EVOLUTION_SLOT;
+    return new Deck(id, name, List.of(cards), slots);
+  }
 
   private static Deck plain(String id, String name, String... cards) {
     return new Deck(id, name, List.of(cards), new int[cards.length]);

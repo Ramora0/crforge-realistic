@@ -7,9 +7,11 @@
 package org.crforge.realistic.server;
 
 import java.io.ByteArrayOutputStream;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
@@ -40,6 +42,28 @@ import java.util.zip.Inflater;
  *               zz each further vertex from the one before
  * colours: 4 bytes each (ABGR as the batch packs them), one or one a vertex (byte flag 1 first
  *          in a MATCH: one a vertex)
+ * with flag 2 (3D models, {@link ModelInstance}), then:
+ * varint  new model refs, each: varint id, varint length and the asset id (ASCII), float32
+ *         transform[16], byte shadow, varint primitives left out and their indices
+ * varint  model draws, each: varint slot from the previous draw's, varint ((reference draw + 1)
+ *         &lt;&lt; 1 | shadow) (0 + 1: none, coded against an empty draw), varint field mask, then the
+ *         fields the mask names, against the reference draw's:
+ *   1     parts: varint count, each: varint ref, host + 1, host node + 1 (then 2, 4, 8 follow,
+ *         coded against zeros)
+ *   2     each part's varint clip, from-clip       4  each part's zz time, zz from-time change
+ *   8     each part's varint blend                 16 zz x, y change
+ *   32    float32 kx, ky                           64 float32 heading
+ *   128   byte flags (1 blue, 2 clipping plane)    256 float32 colour multiply[4], add[3]
+ *   512   float32 light[3]                         1024 zz each rect corner's change (from x, y)
+ *   2048  zz each drawn corner's change (from the rect's)
+ *   4096  float32 tint[4]
+ *   8192  glows: each part's varint primitives (0: none), varint glowing ones, each: varint
+ *         primitive, float32[14]
+ *   16384 effect draws: varint count, each: byte 2 (the reference draw's same one), 1 (it with
+ *         float32 matrix[16]) or 0 then varint ref, float32 matrix[16], byte (shader | 4
+ *         additive | 8 billboard), varint uniforms and float32 each, 5 textures (varint length,
+ *         0 for none, and the id)
+ *   32768 zz effect clock change (1/4096 s)
  * </pre>
  *
  * <p>The reference cursor: a polygon is matched to the first not yet used polygon of the reference
@@ -49,6 +73,11 @@ import java.util.zip.Inflater;
 final class DrawCodec {
 
   static final int KEY = 1;
+
+  /** The payload's flag for its 3D model section. */
+  static final int MODELS = 2;
+
+  private static final ModelInstance EMPTY = new ModelInstance();
 
   private DrawCodec() {}
 
@@ -62,6 +91,11 @@ final class DrawCodec {
     private final Buf out = new Buf();
     private DrawFrame reference;
     private byte[] packed = new byte[1 << 16];
+    private ModelAssets models;
+    private final BitSet refsSent = new BitSet();
+
+    /** The model section's bytes of the last frame, before deflate. */
+    int modelBytes;
 
     /** The size of the last frame before deflate. */
     int rawBytes;
@@ -71,16 +105,26 @@ final class DrawCodec {
       this.deflater = new Deflater(level, true);
     }
 
+    /** The model refs the frames' 3D draws name (needed once a frame has any). */
+    Encoder models(ModelAssets assets) {
+      this.models = assets;
+      return this;
+    }
+
     /** Encodes a frame, as a key frame if asked or if nothing was sent yet. */
     byte[] encode(DrawFrame f, boolean key) {
       out.reset();
       boolean keyframe = key || reference == null;
       DrawFrame ref = keyframe ? new DrawFrame() : reference;
       if (keyframe) lastShape.clear();
-      out.put(keyframe ? KEY : 0);
+      boolean withModels = !f.models.isEmpty();
+      out.put((keyframe ? KEY : 0) | (withModels ? MODELS : 0));
       definitions(f);
       out.varint(f.count);
       ops(f, ref);
+      int before = out.len;
+      if (withModels) modelSection(f, ref);
+      modelBytes = out.len - before;
       rawBytes = out.len;
       reference = f;
       return deflate(out.data, out.len);
@@ -241,6 +285,185 @@ final class DrawCodec {
       }
     }
 
+    private void modelSection(DrawFrame f, DrawFrame ref) {
+      BitSet fresh = new BitSet();
+      for (ModelInstance m : f.models) {
+        for (int r : m.refs) if (!refsSent.get(r)) fresh.set(r);
+        for (ModelInstance.Fx e : m.fx) if (!refsSent.get(e.ref())) fresh.set(e.ref());
+      }
+      out.varint(fresh.cardinality());
+      for (int id = fresh.nextSetBit(0); id >= 0; id = fresh.nextSetBit(id + 1)) {
+        ModelAssets.Ref r = models.ref(id);
+        out.varint(id);
+        byte[] a = r.asset().getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        out.varint(a.length);
+        for (byte b : a) out.put(b);
+        for (float v : r.transform()) out.f32(v);
+        out.put(r.shadow() ? 1 : 0);
+        out.varint(r.skip().length);
+        for (int k : r.skip()) out.varint(k);
+        refsSent.set(id);
+      }
+      out.varint(f.models.size());
+      boolean[] used = new boolean[ref.models.size()];
+      int prevSlot = 0;
+      for (ModelInstance m : f.models) {
+        out.varint(m.slot - prevSlot);
+        prevSlot = m.slot;
+        int r = matchModel(m, ref.models, used);
+        out.varint(((r + 1) << 1) | (m.shadow ? 1 : 0));
+        instance(m, r >= 0 ? ref.models.get(r) : EMPTY);
+      }
+    }
+
+    /** The unused reference draw of the same parts and kind nearest to it, or -1. */
+    private static int matchModel(ModelInstance m, List<ModelInstance> refs, boolean[] used) {
+      int best = -1;
+      long bestD = Long.MAX_VALUE;
+      for (int i = 0; i < refs.size(); i++) {
+        ModelInstance o = refs.get(i);
+        if (used[i] || o.shadow != m.shadow || !Arrays.equals(o.refs, m.refs)) continue;
+        long d = Math.abs((long) o.x - m.x) + Math.abs((long) o.y - m.y);
+        if (d < bestD) {
+          bestD = d;
+          best = i;
+        }
+      }
+      if (best >= 0) used[best] = true;
+      return best;
+    }
+
+    private void instance(ModelInstance m, ModelInstance b) {
+      int n = m.parts();
+      boolean parts = !m.sameParts(b);
+      int[] zeros = new int[n];
+      int[] bClip = parts ? zeros : b.clip;
+      int[] bFrom = parts ? zeros : b.fromClip;
+      int[] bTime = parts ? zeros : b.time;
+      int[] bFromTime = parts ? zeros : b.fromTime;
+      int[] bBlend = parts ? zeros : b.blend;
+      float[][][] bGlows = parts ? new float[n][][] : b.glows;
+      int mask = 0;
+      if (parts) mask |= 1;
+      if (!Arrays.equals(m.clip, bClip) || !Arrays.equals(m.fromClip, bFrom)) mask |= 2;
+      if (!Arrays.equals(m.time, bTime) || !Arrays.equals(m.fromTime, bFromTime)) mask |= 4;
+      if (!Arrays.equals(m.blend, bBlend)) mask |= 8;
+      if (m.x != b.x || m.y != b.y) mask |= 16;
+      if (Float.compare(m.kx, b.kx) != 0 || Float.compare(m.ky, b.ky) != 0) mask |= 32;
+      if (Float.compare(m.heading, b.heading) != 0) mask |= 64;
+      if (m.blue != b.blue || m.clipPlane != b.clipPlane) mask |= 128;
+      if (!Arrays.equals(m.colorMul, b.colorMul) || !Arrays.equals(m.colorAdd, b.colorAdd)) {
+        mask |= 256;
+      }
+      if (!Arrays.equals(m.light, b.light)) mask |= 512;
+      for (int i = 0; i < 4; i++) {
+        if (m.rect[i] - (i % 2 == 0 ? m.x : m.y) != b.rect[i] - (i % 2 == 0 ? b.x : b.y)) {
+          mask |= 1024;
+        }
+        if (m.drawn[i] - m.rect[i] != b.drawn[i] - b.rect[i]) mask |= 2048;
+      }
+      if (!Arrays.equals(m.tint, b.tint)) mask |= 4096;
+      boolean glowsSame = true;
+      for (int p = 0; p < n && glowsSame; p++) {
+        glowsSame = Arrays.deepEquals(m.glows[p], bGlows[p]);
+      }
+      if (!glowsSame) mask |= 8192;
+      if (!m.fx.equals(b.fx)) mask |= 16384;
+      if (m.fxTime != b.fxTime) mask |= 32768;
+      out.varint(mask);
+      if ((mask & 1) != 0) {
+        out.varint(n);
+        for (int p = 0; p < n; p++) {
+          out.varint(m.refs[p]);
+          out.varint(m.host[p] + 1);
+          out.varint(m.hostNode[p] + 1);
+        }
+      }
+      if ((mask & 2) != 0) {
+        for (int p = 0; p < n; p++) {
+          out.varint(m.clip[p]);
+          out.varint(m.fromClip[p]);
+        }
+      }
+      if ((mask & 4) != 0) {
+        for (int p = 0; p < n; p++) {
+          out.zz(m.time[p] - bTime[p]);
+          out.zz(m.fromTime[p] - bFromTime[p]);
+        }
+      }
+      if ((mask & 8) != 0) for (int p = 0; p < n; p++) out.varint(m.blend[p]);
+      if ((mask & 16) != 0) {
+        out.zz(m.x - b.x);
+        out.zz(m.y - b.y);
+      }
+      if ((mask & 32) != 0) {
+        out.f32(m.kx);
+        out.f32(m.ky);
+      }
+      if ((mask & 64) != 0) out.f32(m.heading);
+      if ((mask & 128) != 0) out.put((m.blue ? 1 : 0) | (m.clipPlane ? 2 : 0));
+      if ((mask & 256) != 0) {
+        for (float v : m.colorMul) out.f32(v);
+        for (float v : m.colorAdd) out.f32(v);
+      }
+      if ((mask & 512) != 0) for (float v : m.light) out.f32(v);
+      if ((mask & 1024) != 0) {
+        for (int i = 0; i < 4; i++) {
+          int o = i % 2 == 0 ? m.x : m.y;
+          int bo = i % 2 == 0 ? b.x : b.y;
+          out.zz((m.rect[i] - o) - (b.rect[i] - bo));
+        }
+      }
+      if ((mask & 2048) != 0) {
+        for (int i = 0; i < 4; i++) out.zz((m.drawn[i] - m.rect[i]) - (b.drawn[i] - b.rect[i]));
+      }
+      if ((mask & 4096) != 0) for (float v : m.tint) out.f32(v);
+      if ((mask & 8192) != 0) {
+        for (int p = 0; p < n; p++) {
+          float[][] g = m.glows[p];
+          out.varint(g == null ? 0 : g.length);
+          if (g == null) continue;
+          int lit = 0;
+          for (float[] x : g) if (x != null) lit++;
+          out.varint(lit);
+          for (int k = 0; k < g.length; k++) {
+            if (g[k] == null) continue;
+            out.varint(k);
+            for (int j = 0; j < ModelInstance.GLOW_FLOATS; j++) out.f32(g[k][j]);
+          }
+        }
+      }
+      if ((mask & 16384) != 0) {
+        out.varint(m.fx.size());
+        for (int i = 0; i < m.fx.size(); i++) {
+          ModelInstance.Fx e = m.fx.get(i);
+          ModelInstance.Fx o = i < b.fx.size() ? b.fx.get(i) : null;
+          if (e.equals(o)) {
+            out.put(2);
+            continue;
+          }
+          if (o != null && e.withMatrix(o.matrix()).equals(o)) {
+            out.put(1);
+            for (float v : e.matrix()) out.f32(v);
+            continue;
+          }
+          out.put(0);
+          out.varint(e.ref());
+          for (float v : e.matrix()) out.f32(v);
+          out.put(e.shader() | (e.additive() ? 4 : 0) | (e.billboard() ? 8 : 0));
+          out.varint(e.uniforms().length);
+          for (float v : e.uniforms()) out.f32(v);
+          for (String t : e.textures()) {
+            byte[] a =
+                t == null ? new byte[0] : t.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+            out.varint(a.length);
+            for (byte x : a) out.put(x);
+          }
+        }
+      }
+      if ((mask & 32768) != 0) out.zz(m.fxTime - b.fxTime);
+    }
+
     private void colors(DrawFrame f, int i) {
       int c = f.colorCount(i);
       for (int k = 0; k < c; k++) out.i32(f.colors[f.colorAt[i] + k]);
@@ -313,6 +536,7 @@ final class DrawCodec {
   static final class Decoder {
     final Map<Integer, DrawDefs.State> states = new HashMap<>();
     final Map<Integer, DrawDefs.Region> regions = new HashMap<>();
+    final Map<Integer, ModelAssets.Ref> modelRefs = new HashMap<>();
     private final Map<Integer, int[]> lastShape = new HashMap<>();
     private final Inflater inflater = new Inflater(true);
     private DrawFrame reference;
@@ -418,8 +642,141 @@ final class DrawCodec {
         prevX = f.pos[f.posAt[last]];
         prevY = f.pos[f.posAt[last] + 1];
       }
+      if ((flags & MODELS) != 0) modelSection(in, f, ref);
       reference = f;
       return f;
+    }
+
+    private void modelSection(Reader in, DrawFrame f, DrawFrame ref) {
+      for (int k = in.varint(); k > 0; k--) {
+        int id = in.varint();
+        byte[] a = new byte[in.varint()];
+        for (int i = 0; i < a.length; i++) a[i] = (byte) in.u8();
+        float[] t = new float[16];
+        for (int i = 0; i < 16; i++) t[i] = in.f32();
+        boolean shadow = in.u8() != 0;
+        int[] skip = new int[in.varint()];
+        for (int i = 0; i < skip.length; i++) skip[i] = in.varint();
+        modelRefs.put(
+            id,
+            new ModelAssets.Ref(
+                id, new String(a, java.nio.charset.StandardCharsets.US_ASCII), t, shadow, skip));
+      }
+      int count = in.varint();
+      int slot = 0;
+      for (int k = 0; k < count; k++) {
+        slot += in.varint();
+        int head = in.varint();
+        int r = (head >>> 1) - 1;
+        ModelInstance m = r >= 0 ? ref.models.get(r).copy() : EMPTY.copy();
+        m.slot = slot;
+        m.shadow = (head & 1) != 0;
+        int mask = in.varint();
+        int bx = m.x, by = m.y;
+        int[] rectRel = new int[4];
+        int[] drawnRel = new int[4];
+        for (int i = 0; i < 4; i++) {
+          rectRel[i] = m.rect[i] - (i % 2 == 0 ? bx : by);
+          drawnRel[i] = m.drawn[i] - m.rect[i];
+        }
+        if ((mask & 1) != 0) {
+          int n = in.varint();
+          m.parts(n);
+          for (int p = 0; p < n; p++) {
+            m.refs[p] = in.varint();
+            m.host[p] = in.varint() - 1;
+            m.hostNode[p] = in.varint() - 1;
+          }
+        }
+        int n = m.parts();
+        if ((mask & 2) != 0) {
+          for (int p = 0; p < n; p++) {
+            m.clip[p] = in.varint();
+            m.fromClip[p] = in.varint();
+          }
+        }
+        if ((mask & 4) != 0) {
+          for (int p = 0; p < n; p++) {
+            m.time[p] += in.zz();
+            m.fromTime[p] += in.zz();
+          }
+        }
+        if ((mask & 8) != 0) for (int p = 0; p < n; p++) m.blend[p] = in.varint();
+        if ((mask & 16) != 0) {
+          m.x += in.zz();
+          m.y += in.zz();
+        }
+        if ((mask & 32) != 0) {
+          m.kx = in.f32();
+          m.ky = in.f32();
+        }
+        if ((mask & 64) != 0) m.heading = in.f32();
+        if ((mask & 128) != 0) {
+          int fl = in.u8();
+          m.blue = (fl & 1) != 0;
+          m.clipPlane = (fl & 2) != 0;
+        }
+        if ((mask & 256) != 0) {
+          for (int i = 0; i < 4; i++) m.colorMul[i] = in.f32();
+          for (int i = 0; i < 3; i++) m.colorAdd[i] = in.f32();
+        }
+        if ((mask & 512) != 0) for (int i = 0; i < 3; i++) m.light[i] = in.f32();
+        if ((mask & 1024) != 0) for (int i = 0; i < 4; i++) rectRel[i] += in.zz();
+        for (int i = 0; i < 4; i++) m.rect[i] = rectRel[i] + (i % 2 == 0 ? m.x : m.y);
+        if ((mask & 2048) != 0) for (int i = 0; i < 4; i++) drawnRel[i] += in.zz();
+        for (int i = 0; i < 4; i++) m.drawn[i] = drawnRel[i] + m.rect[i];
+        if ((mask & 4096) != 0) for (int i = 0; i < 4; i++) m.tint[i] = in.f32();
+        if ((mask & 8192) != 0) {
+          for (int p = 0; p < n; p++) {
+            int len = in.varint();
+            if (len == 0) {
+              m.glows[p] = null;
+              continue;
+            }
+            m.glows[p] = new float[len][];
+            for (int lit = in.varint(); lit > 0; lit--) {
+              int prim = in.varint();
+              float[] g = new float[ModelInstance.GLOW_FLOATS];
+              for (int j = 0; j < g.length; j++) g[j] = in.f32();
+              m.glows[p][prim] = g;
+            }
+          }
+        }
+        if ((mask & 16384) != 0) {
+          List<ModelInstance.Fx> before = m.fx;
+          m.fx = new ArrayList<>();
+          for (int e = 0, fxCount = in.varint(); e < fxCount; e++) {
+            int how = in.u8();
+            if (how == 2) {
+              m.fx.add(before.get(e));
+              continue;
+            }
+            if (how == 1) {
+              float[] mat = new float[16];
+              for (int i = 0; i < 16; i++) mat[i] = in.f32();
+              m.fx.add(before.get(e).withMatrix(mat));
+              continue;
+            }
+            int fxRef = in.varint();
+            float[] mat = new float[16];
+            for (int i = 0; i < 16; i++) mat[i] = in.f32();
+            int fl = in.u8();
+            float[] u = new float[in.varint()];
+            for (int i = 0; i < u.length; i++) u[i] = in.f32();
+            String[] tex = new String[5];
+            for (int i = 0; i < 5; i++) {
+              byte[] a = new byte[in.varint()];
+              for (int j = 0; j < a.length; j++) a[j] = (byte) in.u8();
+              tex[i] =
+                  a.length == 0 ? null : new String(a, java.nio.charset.StandardCharsets.US_ASCII);
+            }
+            m.fx.add(
+                new ModelInstance.Fx(fxRef, mat, fl & 3, (fl & 4) != 0, (fl & 8) != 0, u, tex));
+          }
+        }
+        if ((mask & 32768) != 0) m.fxTime += in.zz();
+        f.models.add(m);
+      }
     }
 
     private static void copyMoved(
